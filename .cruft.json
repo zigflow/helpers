@@ -1,0 +1,19 @@
+{
+  "template": "https://github.com/mrsimonemms/new",
+  "commit": "6f9d354501373017c05fcf905450cfb9647ff8bf",
+  "checkout": "main",
+  "context": {
+    "cookiecutter": {
+      "project_name": "helpers",
+      "description": "A collection of Temporal helpers",
+      "author": "Zigflow authors <https://github.com/zigflow/helpers/graphs/contributors>",
+      "repo": "github.com/zigflow/helpers",
+      "_template": "https://github.com/mrsimonemms/new",
+      "_commit": "6f9d354501373017c05fcf905450cfb9647ff8bf"
+    }
+  },
+  "directory": "golang",
+  "skip": [
+    ".git"
+  ]
+}
