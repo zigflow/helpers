@@ -89,7 +89,14 @@ func WithAuthDetection(apiKey, certPath, certKey string) Options {
 
 func WithConnectionOptions(connection *client.ConnectionOptions) Options {
 	return func(o *client.Options) error {
+		tlsConfig := o.ConnectionOptions.TLS
+
 		o.ConnectionOptions = *connection
+
+		// Avoid blatting away anything set by WithTLS
+		if connection.TLS == nil {
+			o.ConnectionOptions.TLS = tlsConfig
+		}
 		return nil
 	}
 }
@@ -201,20 +208,19 @@ func WithPrometheusMetrics(listenAddress, prefix string, registry *prom.Registry
 
 func WithTLS(enabled bool, tlsOpts ...TLSOptions) Options {
 	return func(o *client.Options) error {
-		if enabled {
-			tlsConfig := new(tls.Config)
-
-			for _, opt := range tlsOpts {
-				if err := opt(tlsConfig); err != nil {
-					return fmt.Errorf("error configuring tls options: %w", err)
-				}
-			}
-
-			connectionOpts := &client.ConnectionOptions{
-				TLS: tlsConfig,
-			}
-			return WithConnectionOptions(connectionOpts)(o)
+		if !enabled {
+			return nil
 		}
+
+		tlsConfig := new(tls.Config)
+
+		for _, opt := range tlsOpts {
+			if err := opt(tlsConfig); err != nil {
+				return fmt.Errorf("error configuring tls options: %w", err)
+			}
+		}
+
+		o.ConnectionOptions.TLS = tlsConfig
 		return nil
 	}
 }
