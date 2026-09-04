@@ -136,8 +136,8 @@ func NewCobraOpts(cmd *cobra.Command, opts *TemporalOpts) *TemporalOpts {
 	return opts
 }
 
-func ParseCobraOpts(opts *TemporalOpts, overrides ...Options) []Options {
-	return append([]Options{
+func ParseCobraOpts(opts *TemporalOpts, overrides ...Option) []Option {
+	return append([]Option{
 		WithHostPort(opts.Address),
 		WithNamespace(opts.Namespace),
 		WithTLS(opts.TLSEnabled, WithTLSServerName(opts.ServerName)),

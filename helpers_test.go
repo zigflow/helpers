@@ -47,7 +47,7 @@ const (
 
 // applyOptions applies the options, in order, to a fresh client.Options in the
 // same way newConnection does, stopping at the first error.
-func applyOptions(t *testing.T, options ...Options) (*client.Options, error) {
+func applyOptions(t *testing.T, options ...Option) (*client.Options, error) {
 	t.Helper()
 
 	o := &client.Options{}
@@ -61,7 +61,7 @@ func applyOptions(t *testing.T, options ...Options) (*client.Options, error) {
 }
 
 // mustApplyOptions applies the options and fails the test if any of them error.
-func mustApplyOptions(t *testing.T, options ...Options) *client.Options {
+func mustApplyOptions(t *testing.T, options ...Option) *client.Options {
 	t.Helper()
 
 	o, err := applyOptions(t, options...)

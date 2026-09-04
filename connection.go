@@ -29,12 +29,12 @@ import (
 	"go.temporal.io/sdk/temporal"
 )
 
-type Options func(*client.Options) error
+type Option func(*client.Options) error
 
-type TLSOptions func(*tls.Config) error
+type TLSOption func(*tls.Config) error
 
 // Create a connection to Temporal
-func newConnection(clientOptions *client.Options, options ...Options) (client.Client, error) {
+func newConnection(clientOptions *client.Options, options ...Option) (client.Client, error) {
 	for _, o := range options {
 		if err := o(clientOptions); err != nil {
 			return nil, err
@@ -49,7 +49,7 @@ func newConnection(clientOptions *client.Options, options ...Options) (client.Cl
 // the starting point. This is experimental.
 //
 // @link https://docs.temporal.io/develop/environment-configuration#sdk-usage-example-go
-func NewConnectionWithEnvvars(options ...Options) (client.Client, error) {
+func NewConnectionWithEnvvars(options ...Option) (client.Client, error) {
 	clientOptions, err := envconfig.LoadDefaultClientOptions()
 	if err != nil {
 		return nil, fmt.Errorf("error loading environment config: %w", err)
@@ -61,12 +61,12 @@ func NewConnectionWithEnvvars(options ...Options) (client.Client, error) {
 // New Connection
 //
 // Create a Temporal connection and only use options that are supplied
-func NewConnection(options ...Options) (client.Client, error) {
+func NewConnection(options ...Option) (client.Client, error) {
 	clientOptions := &client.Options{}
 	return newConnection(clientOptions, options...)
 }
 
-func WithAPICredentials(apiKey string) Options {
+func WithAPICredentials(apiKey string) Option {
 	return func(o *client.Options) error {
 		if apiKey != "" {
 			return WithCredentials(client.NewAPIKeyStaticCredentials(apiKey))(o)
@@ -75,7 +75,7 @@ func WithAPICredentials(apiKey string) Options {
 	}
 }
 
-func WithAuthDetection(apiKey, certPath, certKey string) Options {
+func WithAuthDetection(apiKey, certPath, certKey string) Option {
 	if apiKey != "" {
 		return WithAPICredentials(apiKey)
 	}
@@ -87,7 +87,7 @@ func WithAuthDetection(apiKey, certPath, certKey string) Options {
 	return WithNoOp()
 }
 
-func WithConnectionOptions(connection *client.ConnectionOptions) Options {
+func WithConnectionOptions(connection *client.ConnectionOptions) Option {
 	return func(o *client.Options) error {
 		tlsConfig := o.ConnectionOptions.TLS
 
@@ -101,21 +101,21 @@ func WithConnectionOptions(connection *client.ConnectionOptions) Options {
 	}
 }
 
-func WithCredentials(credential client.Credentials) Options {
+func WithCredentials(credential client.Credentials) Option {
 	return func(o *client.Options) error {
 		o.Credentials = credential
 		return nil
 	}
 }
 
-func WithDataConverter(cvt converter.DataConverter) Options {
+func WithDataConverter(cvt converter.DataConverter) Option {
 	return func(o *client.Options) error {
 		o.DataConverter = cvt
 		return nil
 	}
 }
 
-func WithDataAndFailureConverter(cvt converter.DataConverter) Options {
+func WithDataAndFailureConverter(cvt converter.DataConverter) Option {
 	return func(o *client.Options) error {
 		if err := WithDataConverter(cvt)(o); err != nil {
 			return err
@@ -125,14 +125,14 @@ func WithDataAndFailureConverter(cvt converter.DataConverter) Options {
 	}
 }
 
-func WithExternalStorage(st converter.ExternalStorage) Options {
+func WithExternalStorage(st converter.ExternalStorage) Option {
 	return func(o *client.Options) error {
 		o.ExternalStorage = st
 		return nil
 	}
 }
 
-func WithFailureConverter(cvt converter.DataConverter) Options {
+func WithFailureConverter(cvt converter.DataConverter) Option {
 	return func(o *client.Options) error {
 		o.FailureConverter = temporal.NewDefaultFailureConverter(
 			temporal.DefaultFailureConverterOptions{
@@ -144,7 +144,7 @@ func WithFailureConverter(cvt converter.DataConverter) Options {
 	}
 }
 
-func WithHostPort(hostPort string) Options {
+func WithHostPort(hostPort string) Option {
 	return func(o *client.Options) error {
 		if hostPort == "" {
 			hostPort = client.DefaultHostPort
@@ -154,21 +154,21 @@ func WithHostPort(hostPort string) Options {
 	}
 }
 
-func WithLogger(logger log.Logger) Options {
+func WithLogger(logger log.Logger) Option {
 	return func(o *client.Options) error {
 		o.Logger = logger
 		return nil
 	}
 }
 
-func WithMetrics(metrics client.MetricsHandler) Options {
+func WithMetrics(metrics client.MetricsHandler) Option {
 	return func(o *client.Options) error {
 		o.MetricsHandler = metrics
 		return nil
 	}
 }
 
-func WithMTLS(certPath, certKey string) Options {
+func WithMTLS(certPath, certKey string) Option {
 	return func(o *client.Options) error {
 		// Use the crypto/tls package to create a cert object
 		cert, err := tls.LoadX509KeyPair(certPath, certKey)
@@ -180,7 +180,7 @@ func WithMTLS(certPath, certKey string) Options {
 	}
 }
 
-func WithNamespace(namespace string) Options {
+func WithNamespace(namespace string) Option {
 	return func(o *client.Options) error {
 		if namespace == "" {
 			namespace = client.DefaultNamespace
@@ -190,13 +190,13 @@ func WithNamespace(namespace string) Options {
 	}
 }
 
-func WithNoOp() Options {
+func WithNoOp() Option {
 	return func(o *client.Options) error {
 		return nil
 	}
 }
 
-func WithPrometheusMetrics(listenAddress, prefix string, registry *prom.Registry) Options {
+func WithPrometheusMetrics(listenAddress, prefix string, registry *prom.Registry) Option {
 	return func(o *client.Options) error {
 		metrics, err := NewPrometheusHandler(listenAddress, prefix, registry)
 		if err != nil {
@@ -206,7 +206,7 @@ func WithPrometheusMetrics(listenAddress, prefix string, registry *prom.Registry
 	}
 }
 
-func WithTLS(enabled bool, tlsOpts ...TLSOptions) Options {
+func WithTLS(enabled bool, tlsOpts ...TLSOption) Option {
 	return func(o *client.Options) error {
 		if !enabled {
 			return nil
@@ -225,12 +225,12 @@ func WithTLS(enabled bool, tlsOpts ...TLSOptions) Options {
 	}
 }
 
-func WithZerolog(logger *zerolog.Logger) Options {
+func WithZerolog(logger *zerolog.Logger) Option {
 	return WithLogger(NewZerologHandler(logger))
 }
 
 // TLS options
-func WithTLSServerName(serverName string) TLSOptions {
+func WithTLSServerName(serverName string) TLSOption {
 	return func(c *tls.Config) error {
 		if serverName == "" {
 			return nil
