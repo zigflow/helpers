@@ -203,9 +203,9 @@ func NewHealthCheck(ctx context.Context, taskQueues []string, address string, c 
 
 	srv := &http.Server{
 		Addr:              address,
-		ReadHeaderTimeout: time.Second,
-		ReadTimeout:       time.Second,
-		WriteTimeout:      time.Second,
+		ReadHeaderTimeout: 3 * time.Second,
+		ReadTimeout:       3 * time.Second,
+		WriteTimeout:      3 * time.Second,
 		Handler:           mux,
 	}
 
