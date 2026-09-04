@@ -29,8 +29,7 @@ import (
 //  2. Defer a block that calls compensate when the workflow is failing.
 //  3. After each forward step succeeds, call add to register its undo.
 //  4. If the workflow returns an error, the deferred block calls compensate,
-//     which runs the registered functions in reverse order from a disconnected
-//     context so they are not cancelled along with the failing workflow.
+//     which runs the registered functions in reverse order.
 type Compensator struct {
 	fns []func(workflow.Context) error
 }
