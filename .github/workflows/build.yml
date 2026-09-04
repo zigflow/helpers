@@ -42,7 +42,7 @@ jobs:
           python-version: 3.x
 
       - name: Install dependencies
-        run: go install ./...
+        run: go mod download
 
       - name: go-vet
         run: go vet -v ./...
