@@ -2,7 +2,9 @@
   "name": "devcontainer",
   "image": "ghcr.io/mrsimonemms/devcontainers/full",
   "features": {
-    "ghcr.io/guiyomh/features/goreleaser:0": {}
+    "ghcr.io/mrsimonemms/devcontainers/air:1": {},
+    "ghcr.io/guiyomh/features/goreleaser:0": {},
+    "ghcr.io/devcontainers-extra/features/temporal-cli:1": {}
   },
   "customizations": {
     "vscode": {
@@ -12,5 +14,9 @@
   },
   "containerEnv": {
     "GIT_REPO": "github.com/zigflow/helpers"
-  }
+  },
+  "forwardPorts": [
+    7233,
+    8233
+  ]
 }
