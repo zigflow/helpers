@@ -19,9 +19,12 @@ package temporal
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -515,4 +518,201 @@ func (d *deadlineRecordingClient) CheckHealth(
 	d.onCheck(ctx)
 
 	return &client.CheckHealthResponse{}, nil
+}
+
+// Bounds for the lifecycle tests below. They are deliberately small: every wait
+// is for work that has already been started on another goroutine, so the
+// deadlines only exist so a broken implementation fails rather than hangs.
+const (
+	// maxAddressAttempts bounds how many loopback ports a test will try before
+	// giving up on finding a free one.
+	maxAddressAttempts = 20
+	// requestTimeout bounds a single healthcheck HTTP request.
+	requestTimeout = 5 * time.Second
+	// shutdownTimeout bounds how long a test waits for the server to stop.
+	shutdownTimeout = 5 * time.Second
+	// pollInterval is how long requireNotServing waits between connection
+	// attempts once one has been refused... it retries rather than sleeps.
+	pollInterval = 5 * time.Millisecond
+)
+
+// freeLoopbackAddress asks the kernel for an unused loopback port and returns
+// the address it assigned. The listener is closed before returning because
+// NewHealthCheck takes an address and binds the port itself, so a test cannot
+// hand it a listener it is already holding. That leaves a window in which
+// something else could claim the port, so callers must treat a bind failure as
+// "pick another port" rather than a test failure - see startHealthCheck.
+func freeLoopbackAddress(t *testing.T) string {
+	t.Helper()
+
+	l, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	address := l.Addr().String()
+	require.NoError(t, l.Close())
+
+	return address
+}
+
+// startHealthCheck starts a healthcheck on a free loopback address, moving to a
+// different port if the one it picked was claimed in the meantime, and returns
+// the address it is listening on. Any error other than "address already in use"
+// fails the test immediately.
+func startHealthCheck(t *testing.T, ctx context.Context, c client.Client, taskQueues ...string) string {
+	t.Helper()
+
+	for range maxAddressAttempts {
+		address := freeLoopbackAddress(t)
+
+		err := NewHealthCheck(ctx, taskQueues, address, c)
+		if err == nil {
+			return address
+		}
+
+		require.ErrorIs(t, err, syscall.EADDRINUSE, "unexpected error starting the healthcheck")
+	}
+
+	t.Fatalf("no free loopback port found after %d attempts", maxAddressAttempts)
+
+	return ""
+}
+
+// newTestHTTPClient builds a client with its own transport so that no test
+// touches the shared default transport, and with keep-alives disabled so that a
+// pooled connection cannot make a stopped server look like it is still up.
+func newTestHTTPClient(t *testing.T) *http.Client {
+	t.Helper()
+
+	transport := &http.Transport{DisableKeepAlives: true}
+	t.Cleanup(transport.CloseIdleConnections)
+
+	return &http.Client{Transport: transport, Timeout: requestTimeout}
+}
+
+// getLiveness performs a GET /livez against the address, returning the status
+// code and body, or the transport error if the request never got a response.
+func getLiveness(t *testing.T, c *http.Client, address string) (status int, body string, err error) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+address+"/livez", http.NoBody)
+	require.NoError(t, err)
+
+	resp, err := c.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	return resp.StatusCode, string(raw), nil
+}
+
+// requireNotServing waits for the address to stop answering requests. Shutdown
+// runs on a goroutine, so the settled state can only be observed by retrying;
+// each attempt is a real connection attempt that fails as soon as the listener
+// has gone, so nothing here sleeps waiting for a fixed period.
+func requireNotServing(t *testing.T, c *http.Client, address string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		if _, _, err := getLiveness(t, c, address); err != nil {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			t.Fatalf("%s was still serving requests after %s", address, shutdownTimeout)
+		case <-ticker.C:
+		}
+	}
+}
+
+// TestNewHealthCheck covers the startup and shutdown behaviour of
+// NewHealthCheck. The request handling itself is covered by the handler tests
+// above, so these tests only ever ask for /livez as proof of life.
+//
+// None of these subtests are parallel: they each occupy a loopback port for
+// their duration and the retry in startHealthCheck is there to survive
+// interference from outside the package, not from the tests next to it.
+func TestNewHealthCheck(t *testing.T) {
+	t.Run("returns an error when the address cannot be bound", func(t *testing.T) {
+		occupied, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = occupied.Close() })
+
+		address := occupied.Addr().String()
+
+		// The context is never cancelled: if NewHealthCheck reports an error it
+		// must not have started any goroutines that need cancelling.
+		err = NewHealthCheck(context.Background(), []string{testTaskQueue}, address, newFakeTemporalClient())
+
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "error listening on")
+		assert.ErrorContains(t, err, address, "the error names the address that could not be bound")
+		assert.ErrorIs(t, err, syscall.EADDRINUSE)
+
+		// Releasing the port shows the failed call left nothing serving on it.
+		require.NoError(t, occupied.Close())
+		requireNotServing(t, newTestHTTPClient(t), address)
+	})
+
+	t.Run("returns nil once the listener is serving", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		address := startHealthCheck(t, ctx, newFakeTemporalClient(), testTaskQueue)
+
+		// The listener is created before NewHealthCheck returns, so the
+		// connection is accepted even if Serve has not been scheduled yet: no
+		// polling is needed to see the first request answered.
+		status, body, err := getLiveness(t, newTestHTTPClient(t), address)
+
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusOK, status)
+		assert.JSONEq(t, `{"healthy":true}`, body, "the fake client reports a healthy Temporal")
+	})
+
+	t.Run("shuts down when the context is cancelled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		httpClient := newTestHTTPClient(t)
+		address := startHealthCheck(t, ctx, newFakeTemporalClient(), testTaskQueue)
+
+		status, _, err := getLiveness(t, httpClient, address)
+		require.NoError(t, err, "the healthcheck should serve before the context is cancelled")
+		require.Equal(t, http.StatusOK, status)
+
+		cancel()
+
+		requireNotServing(t, httpClient, address)
+	})
+
+	t.Run("an already cancelled context binds but does not stay up", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		// The address is a literal IP, so net.ListenConfig.Listen needs no name
+		// resolution and binds without ever consulting the context: the current
+		// implementation returns nil here rather than a context error.
+		// startHealthCheck asserts that nil for us.
+		address := startHealthCheck(t, ctx, newFakeTemporalClient(), testTaskQueue)
+
+		// The shutdown goroutine sees the cancelled context straight away, so
+		// the server tears itself down. A request that lands in the gap between
+		// Listen and Shutdown may still be answered, so only the settled state
+		// is asserted.
+		requireNotServing(t, newTestHTTPClient(t), address)
+	})
 }

@@ -24,11 +24,26 @@ cmd := &cobra.Command{
 	Use:   "run",
 	Short: "Run a Temporal worker",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := temporal.NewConnection(append(
-			temporal.ParseCobraOpts(opts.temporal),
-			temporal.WithZerolog(&log.Logger),
-			temporal.WithPrometheusMetrics(opts.temporal.MetricsListenAddress, opts.temporal.MetricsPrefix, nil),
-		)...)
+		metrics, err := temporal.NewPrometheusHandler(
+			opts.temporal.MetricsListenAddress,
+			opts.temporal.MetricsPrefix,
+			nil,
+		)
+		if err != nil {
+			return gh.FatalError{
+				Cause: err,
+				Msg:   "Error creating Prometheus handler",
+			}
+		}
+		defer metrics.Close()
+
+		c, err := temporal.NewConnection(
+			append(
+				temporal.ParseCobraOpts(opts.temporal),
+				temporal.WithZerolog(&log.Logger),
+				temporal.WithMetrics(metrics),
+			)...,
+		)
 		if err != nil {
 			return gh.FatalError{
 				Cause: err,
@@ -40,7 +55,12 @@ cmd := &cobra.Command{
 		w := worker.New(c, TaskQueue, worker.Options{})
 
 		// Start the healthcheck server in a separate goroutine
-		temporal.NewHealthCheck(cmd.Context(), []string{TaskQueue}, opts.temporal.HealthListenAddress, c)
+		if err := temporal.NewHealthCheck(cmd.Context(), []string{TaskQueue}, opts.temporal.HealthListenAddress, c); err != nil {
+			return gh.FatalError{
+				Cause: err,
+				Msg:   "Error creating health check",
+			}
+		}
 
 		if err := w.Run(worker.InterruptCh()); err != nil {
 			return gh.FatalError{

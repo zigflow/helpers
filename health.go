@@ -20,6 +20,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -189,7 +191,7 @@ func (h *healthcheck) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func NewHealthCheck(ctx context.Context, taskQueues []string, address string, c client.Client) {
+func NewHealthCheck(ctx context.Context, taskQueues []string, address string, c client.Client) error {
 	h := &healthcheck{
 		client:     c,
 		taskQueues: taskQueues,
@@ -207,6 +209,16 @@ func NewHealthCheck(ctx context.Context, taskQueues []string, address string, c 
 		Handler:           mux,
 	}
 
+	l := log.With().
+		Str("address", address).
+		Int("taskQueueCount", len(taskQueues)).
+		Logger()
+
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", address)
+	if err != nil {
+		return fmt.Errorf("error listening on %s: %w", address, err)
+	}
+
 	go func() {
 		<-ctx.Done()
 
@@ -214,18 +226,17 @@ func NewHealthCheck(ctx context.Context, taskQueues []string, address string, c 
 		defer cancel()
 
 		if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error().Err(err).Msg("Error shutting down healthcheck service")
+			l.Error().Err(err).Msg("Error shutting down healthcheck service")
 		}
 	}()
 
 	go func() {
-		log.Info().
-			Str("address", address).
-			Int("taskQueueCount", len(taskQueues)).
-			Msg("Starting healthcheck service")
+		l.Info().Msg("Starting healthcheck service")
 
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal().Err(err).Msg("Error serving health check connection")
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			l.Error().Err(err).Msg("Healthcheck server stopped")
 		}
 	}()
+
+	return nil
 }
