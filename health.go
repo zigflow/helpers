@@ -180,6 +180,8 @@ func (h *healthcheck) serveReadiness(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, statusCode, resp)
 }
 
+// ServeHTTP routes the health endpoints. /health is an alias of /readyz, and
+// anything else is a 404.
 func (h *healthcheck) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/livez":
@@ -191,6 +193,24 @@ func (h *healthcheck) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// NewHealthCheck starts an HTTP health server for a Temporal worker and
+// returns once it is listening.
+//
+// Three endpoints are served on address:
+//
+//   - /livez reports whether the Temporal service is reachable.
+//   - /readyz reports Temporal reachability and additionally describes the
+//     workflow and activity task queues named in taskQueues.
+//   - /health is an alias of /readyz.
+//
+// A healthy check responds 200 and an unhealthy one 503, both with a JSON body
+// describing what was checked. Each request gets its own two second timeout.
+//
+// The listener is created synchronously, so an address that cannot be bound is
+// returned as an error and nothing is started. The server then runs in the
+// background and shuts down when ctx is cancelled. Errors from the running
+// server, and from that shutdown, are logged rather than returned, so they are
+// not observable through the returned error.
 func NewHealthCheck(ctx context.Context, taskQueues []string, address string, c client.Client) error {
 	h := &healthcheck{
 		client:     c,

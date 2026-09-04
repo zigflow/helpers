@@ -81,6 +81,9 @@ import (
 	"go.temporal.io/sdk/client"
 )
 
+// TemporalOpts holds the values behind the flags registered by [NewCobraOpts].
+// Declare one, or embed it in a command's own options struct, and pass a
+// pointer to [NewCobraOpts].
 type TemporalOpts struct {
 	Address              string
 	APIKey               string
@@ -94,6 +97,19 @@ type TemporalOpts struct {
 	TLSEnabled           bool
 }
 
+// NewCobraOpts registers the Temporal flags on cmd, binding each one to a
+// field of opts, and returns opts for convenience.
+//
+// Every flag takes its default from Viper, so a value can equally come from a
+// config file or the environment. The keys are health_listen_address,
+// metrics_listen_address, metrics_prefix, temporal_address, temporal_api_key,
+// temporal_tls_client_cert_path, temporal_tls_client_key_path,
+// temporal_namespace, temporal_server_name and temporal_tls. The two listen
+// addresses, the address and the namespace have defaults; the rest default to
+// empty.
+//
+// The API key's default is hidden from the help output, so a key already in the
+// configuration is not printed to the terminal.
 func NewCobraOpts(cmd *cobra.Command, opts *TemporalOpts) *TemporalOpts {
 	viper.SetDefault("health_listen_address", "0.0.0.0:3000")
 	cmd.Flags().StringVar(
@@ -156,6 +172,16 @@ func NewCobraOpts(cmd *cobra.Command, opts *TemporalOpts) *TemporalOpts {
 	return opts
 }
 
+// ParseCobraOpts turns parsed [TemporalOpts] into the connection options for
+// [NewConnection]: host and port, namespace, TLS with its server name, and
+// whichever authentication [WithAuthDetection] selects.
+//
+// Overrides are appended, so they are applied last and win over the derived
+// options.
+//
+// The health and metrics listen addresses are not included, because they
+// configure servers rather than the client. Wire those up separately with
+// [NewHealthCheck] and [NewPrometheusHandler], as in the example above.
 func ParseCobraOpts(opts *TemporalOpts, overrides ...Option) []Option {
 	return append([]Option{
 		WithHostPort(opts.Address),

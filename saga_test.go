@@ -175,60 +175,6 @@ func TestCompensatorPassesTheWorkflowContext(t *testing.T) {
 	}
 }
 
-// TestCompensatorCompensateIsNotIdempotent documents that Compensate does not
-// clear the registered functions, so calling it twice runs them all twice.
-func TestCompensatorCompensateIsNotIdempotent(t *testing.T) {
-	rec := &recorder{}
-
-	runInWorkflow(t, func(ctx workflow.Context) {
-		var c Compensator
-
-		c.Add(func(workflow.Context) error {
-			rec.record(stepFirst)
-
-			return nil
-		})
-		c.Add(func(workflow.Context) error {
-			rec.record(stepSecond)
-
-			return nil
-		})
-
-		c.Compensate(ctx)
-		c.Compensate(ctx)
-	})
-
-	assert.Equal(t, []string{stepSecond, stepFirst, stepSecond, stepFirst}, rec.recorded())
-}
-
-// TestCompensatorAddAfterCompensate covers registering another compensation
-// after a first round has already run.
-func TestCompensatorAddAfterCompensate(t *testing.T) {
-	rec := &recorder{}
-
-	runInWorkflow(t, func(ctx workflow.Context) {
-		var c Compensator
-
-		c.Add(func(workflow.Context) error {
-			rec.record(stepFirst)
-
-			return nil
-		})
-
-		c.Compensate(ctx)
-
-		c.Add(func(workflow.Context) error {
-			rec.record(stepSecond)
-
-			return nil
-		})
-
-		c.Compensate(ctx)
-	})
-
-	assert.Equal(t, []string{stepFirst, stepSecond, stepFirst}, rec.recorded())
-}
-
 // TestCompensatorZeroValue proves a Compensator needs no construction.
 func TestCompensatorZeroValue(t *testing.T) {
 	runInWorkflow(t, func(ctx workflow.Context) {

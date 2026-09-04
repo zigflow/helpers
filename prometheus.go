@@ -29,11 +29,20 @@ import (
 	sdktally "go.temporal.io/sdk/contrib/tally"
 )
 
+// PrometheusHandler is a Temporal metrics handler backed by a Prometheus
+// reporter.
+//
+// It embeds the SDK's metrics handler interface, so it can be passed straight
+// to [WithMetrics], and it owns the underlying Tally scope. The caller owns the
+// handler, and is responsible for calling [PrometheusHandler.Close].
 type PrometheusHandler struct {
 	client.MetricsHandler
 	closer io.Closer
 }
 
+// Close flushes and releases the underlying Tally scope, and reports whatever
+// the scope reports. A handler with no scope to release, such as the zero
+// value, closes without error.
 func (h *PrometheusHandler) Close() error {
 	if h.closer == nil {
 		return nil
@@ -42,6 +51,27 @@ func (h *PrometheusHandler) Close() error {
 	return h.closer.Close()
 }
 
+// NewPrometheusHandler creates a Prometheus-backed metrics handler for a
+// Temporal client. The caller owns it and should call
+// [PrometheusHandler.Close] when it is no longer needed, usually with defer.
+//
+// Metrics are served on listenAddress under /metrics, with prefix prepended to
+// every metric name. An empty listenAddress attaches the metrics endpoint to
+// Go's default HTTP mux instead of starting a server of its own. A nil registry
+// uses the Prometheus default registry. Timers are reported as histograms.
+//
+// The optional onError argument decides how the reporter reports its own
+// failures:
+//
+//   - not supplied: failures are logged at fatal level, terminating the process
+//   - one function: that function is called with the error
+//   - explicitly nil: nil is passed through to Tally, so Tally's own default
+//     behaviour applies
+//   - more than one: an error is returned and no handler is created
+//
+// Reporter failures are not returned from here. A listen address that cannot be
+// bound, for example, is reported asynchronously through onError once the
+// reporter is running.
 func NewPrometheusHandler(
 	listenAddress,
 	prefix string,

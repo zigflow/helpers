@@ -29,8 +29,13 @@ import (
 	"go.temporal.io/sdk/temporal"
 )
 
+// Option configures a [client.Options] before the connection is dialled.
+// Options are applied in the order they are given, so a later option
+// overwrites an earlier one that sets the same field.
 type Option func(*client.Options) error
 
+// TLSOption configures the [tls.Config] built by [WithTLS]. TLS options are
+// applied in order, and only when TLS is enabled.
 type TLSOption func(*tls.Config) error
 
 // Create a connection to Temporal
@@ -43,10 +48,11 @@ func newConnection(clientOptions *client.Options, options ...Option) (client.Cli
 	return client.Dial(*clientOptions)
 }
 
-// NewConnectionWithEnvvars
+// NewConnectionWithEnvvars creates a Temporal connection using the Temporal
+// SDK environment configuration as its starting point, then applies options on
+// top, so an option always wins over the environment.
 //
-// Create a Temporal connection, with the Temporal environment config loader as
-// the starting point. This is experimental.
+// This is experimental.
 //
 // @link https://docs.temporal.io/develop/environment-configuration#sdk-usage-example-go
 func NewConnectionWithEnvvars(options ...Option) (client.Client, error) {
@@ -58,14 +64,16 @@ func NewConnectionWithEnvvars(options ...Option) (client.Client, error) {
 	return newConnection(&clientOptions, options...)
 }
 
-// New Connection
-//
-// Create a Temporal connection and only use options that are supplied
+// NewConnection creates a Temporal connection from the supplied options only,
+// starting from a zero-valued [client.Options]. Anything an option does not set
+// keeps the SDK's own default.
 func NewConnection(options ...Option) (client.Client, error) {
 	clientOptions := &client.Options{}
 	return newConnection(clientOptions, options...)
 }
 
+// WithAPICredentials authenticates with a Temporal API key. An empty apiKey is
+// a no-op, so it leaves any credentials already configured in place.
 func WithAPICredentials(apiKey string) Option {
 	return func(o *client.Options) error {
 		if apiKey != "" {
@@ -75,6 +83,15 @@ func WithAPICredentials(apiKey string) Option {
 	}
 }
 
+// WithAuthDetection chooses an authentication method from whichever values are
+// supplied, in precedence order:
+//
+//  1. an API key, when apiKey is not empty
+//  2. mTLS, when both certPath and certKey are not empty
+//  3. otherwise no authentication option is applied, via [WithNoOp]
+//
+// Only one method is ever used, and the choice is made when the option is
+// built rather than when it is applied.
 func WithAuthDetection(apiKey, certPath, certKey string) Option {
 	if apiKey != "" {
 		return WithAPICredentials(apiKey)
@@ -87,6 +104,12 @@ func WithAuthDetection(apiKey, certPath, certKey string) Option {
 	return WithNoOp()
 }
 
+// WithConnectionOptions replaces the whole of the client's connection options.
+//
+// TLS is the exception: when connection.TLS is nil, TLS configured by [WithTLS]
+// is preserved, so the two options compose in either order without silently
+// discarding each other's settings. Set connection.TLS to override that
+// deliberately.
 func WithConnectionOptions(connection *client.ConnectionOptions) Option {
 	return func(o *client.Options) error {
 		tlsConfig := o.ConnectionOptions.TLS
@@ -101,6 +124,9 @@ func WithConnectionOptions(connection *client.ConnectionOptions) Option {
 	}
 }
 
+// WithCredentials sets the credentials used to authenticate with Temporal.
+// [WithAPICredentials], [WithMTLS] and [WithAuthDetection] are usually more
+// convenient.
 func WithCredentials(credential client.Credentials) Option {
 	return func(o *client.Options) error {
 		o.Credentials = credential
@@ -108,6 +134,8 @@ func WithCredentials(credential client.Credentials) Option {
 	}
 }
 
+// WithDataConverter sets the converter used for workflow and activity
+// payloads. It does not affect failures; see [WithDataAndFailureConverter].
 func WithDataConverter(cvt converter.DataConverter) Option {
 	return func(o *client.Options) error {
 		o.DataConverter = cvt
@@ -115,6 +143,10 @@ func WithDataConverter(cvt converter.DataConverter) Option {
 	}
 }
 
+// WithDataAndFailureConverter applies cvt as both the data converter and, via
+// [WithFailureConverter], the failure converter. This is normally what an
+// encrypting or compressing converter wants, so that failure detail is covered
+// as well as payloads.
 func WithDataAndFailureConverter(cvt converter.DataConverter) Option {
 	return func(o *client.Options) error {
 		if err := WithDataConverter(cvt)(o); err != nil {
@@ -125,6 +157,8 @@ func WithDataAndFailureConverter(cvt converter.DataConverter) Option {
 	}
 }
 
+// WithExternalStorage sets the external storage used for payloads too large to
+// send to the Temporal server inline.
 func WithExternalStorage(st converter.ExternalStorage) Option {
 	return func(o *client.Options) error {
 		o.ExternalStorage = st
@@ -132,6 +166,9 @@ func WithExternalStorage(st converter.ExternalStorage) Option {
 	}
 }
 
+// WithFailureConverter sets a failure converter that encodes failures with cvt.
+// Common failure attributes, such as the message and stack trace, are encoded
+// too, so a converter that encrypts payloads also covers failure detail.
 func WithFailureConverter(cvt converter.DataConverter) Option {
 	return func(o *client.Options) error {
 		o.FailureConverter = temporal.NewDefaultFailureConverter(
@@ -144,6 +181,8 @@ func WithFailureConverter(cvt converter.DataConverter) Option {
 	}
 }
 
+// WithHostPort sets the address of the Temporal frontend. An empty hostPort
+// falls back to the SDK default of [client.DefaultHostPort].
 func WithHostPort(hostPort string) Option {
 	return func(o *client.Options) error {
 		if hostPort == "" {
@@ -154,6 +193,8 @@ func WithHostPort(hostPort string) Option {
 	}
 }
 
+// WithLogger sets the logger used by the client, and by any worker created from
+// it. Use [WithZerolog] to pass an existing Zerolog logger.
 func WithLogger(logger log.Logger) Option {
 	return func(o *client.Options) error {
 		o.Logger = logger
@@ -161,6 +202,9 @@ func WithLogger(logger log.Logger) Option {
 	}
 }
 
+// WithMetrics sets the client's metrics handler. Pass the handler returned by
+// [NewPrometheusHandler] when the caller needs to close it; [WithPrometheusMetrics]
+// is the shorter option when it does not.
 func WithMetrics(metrics client.MetricsHandler) Option {
 	return func(o *client.Options) error {
 		o.MetricsHandler = metrics
@@ -168,6 +212,15 @@ func WithMetrics(metrics client.MetricsHandler) Option {
 	}
 }
 
+// WithMTLS authenticates with an mTLS client certificate, loading the key pair
+// from disk when the option is applied. A pair that cannot be loaded, or whose
+// key does not match its certificate, is reported as an error from the
+// connection constructor.
+//
+// The SDK applies the certificate to the connection's TLS configuration when
+// the client is dialled, creating one if none is set, so TLS is in use without
+// also calling [WithTLS]. Use [WithTLS] when the TLS configuration itself needs
+// customising, for example with [WithTLSServerName].
 func WithMTLS(certPath, certKey string) Option {
 	return func(o *client.Options) error {
 		// Use the crypto/tls package to create a cert object
@@ -180,6 +233,8 @@ func WithMTLS(certPath, certKey string) Option {
 	}
 }
 
+// WithNamespace sets the Temporal namespace. An empty namespace falls back to
+// the SDK default of [client.DefaultNamespace].
 func WithNamespace(namespace string) Option {
 	return func(o *client.Options) error {
 		if namespace == "" {
@@ -190,6 +245,9 @@ func WithNamespace(namespace string) Option {
 	}
 }
 
+// WithNoOp does nothing. It is useful where an [Option] has to be returned but
+// there is nothing to configure, as [WithAuthDetection] does when no
+// credentials are supplied.
 func WithNoOp() Option {
 	return func(o *client.Options) error {
 		return nil
@@ -229,6 +287,11 @@ func WithPrometheusMetrics(listenAddress, prefix string, registry *prom.Registry
 	}
 }
 
+// WithTLS enables TLS and builds the connection's [tls.Config] from tlsOpts.
+//
+// When enabled is false the option is a no-op: it does not clear TLS
+// configuration set elsewhere, so a disabled flag cannot accidentally undo
+// mTLS credentials or [WithConnectionOptions].
 func WithTLS(enabled bool, tlsOpts ...TLSOption) Option {
 	return func(o *client.Options) error {
 		if !enabled {
@@ -248,11 +311,16 @@ func WithTLS(enabled bool, tlsOpts ...TLSOption) Option {
 	}
 }
 
+// WithZerolog uses an existing Zerolog logger as the client logger. It is
+// shorthand for [WithLogger] with [NewZerologHandler].
 func WithZerolog(logger *zerolog.Logger) Option {
 	return WithLogger(NewZerologHandler(logger))
 }
 
-// TLS options
+// WithTLSServerName overrides the TLS server name (SNI) used to validate the
+// server certificate. It is needed when the endpoint address does not match the
+// certificate hostname, for example behind AWS PrivateLink. An empty serverName
+// is a no-op.
 func WithTLSServerName(serverName string) TLSOption {
 	return func(c *tls.Config) error {
 		if serverName == "" {

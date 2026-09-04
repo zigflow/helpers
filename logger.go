@@ -24,7 +24,12 @@ import (
 	"go.temporal.io/sdk/log"
 )
 
-// NewZerologHandler converts an instance of Zerolog into a Temporal log handler
+// NewZerologHandler adapts a Zerolog logger to the Temporal SDK's logger
+// interface, so client and worker logs join the application's own output.
+// Levels and structured key/value pairs are passed through, and the level
+// configured on zlog still applies.
+//
+// See [WithZerolog] to use the result as a client logger.
 func NewZerologHandler(zlog *zerolog.Logger) log.Logger {
 	return log.NewStructuredLogger(slog.New(slogzerolog.Option{
 		Logger: zlog,

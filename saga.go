@@ -25,23 +25,35 @@ import (
 // Compensator is a LIFO stack of compensation functions for the saga pattern.
 //
 // Usage pattern:
-//  1. Declare a Compensator at the top of the workflow function.
-//  2. Defer a block that calls compensate when the workflow is failing.
-//  3. After each forward step succeeds, call add to register its undo.
-//  4. If the workflow returns an error, the deferred block calls compensate,
-//     which runs the registered functions in reverse order.
+//  1. Declare a Compensator at the top of the workflow function. The zero
+//     value is ready to use.
+//  2. Defer a block that calls [Compensator.Compensate] when the workflow is
+//     failing.
+//  3. After each forward step succeeds, call [Compensator.Add] to register its
+//     undo.
+//  4. If the workflow returns an error, the deferred block compensates, running
+//     the registered functions in reverse order.
+//
+// Compensate uses whichever [workflow.Context] the caller passes it. It does
+// not create a disconnected context, so a workflow that has to compensate
+// after cancellation must create one itself with
+// [workflow.NewDisconnectedContext].
 type Compensator struct {
 	fns []func(workflow.Context) error
 }
 
-// Add registers a compensation function. Functions are called in LIFO order.
+// Add registers a compensation function, undoing the forward step that has
+// just succeeded. Registration order is the order steps succeed in, and
+// [Compensator.Compensate] calls the functions in reverse.
 func (c *Compensator) Add(fn func(workflow.Context) error) {
 	c.fns = append(c.fns, fn)
 }
 
-// Compensate runs all registered compensations in reverse order using ctx.
-// Individual compensation failures are logged and do not mask the original
-// workflow error.
+// Compensate runs every registered compensation in reverse order, using ctx.
+//
+// All of them are attempted even when one fails: a failure is logged through
+// the workflow logger and the next compensation still runs. Nothing is
+// returned, so the original workflow error is not masked.
 func (c *Compensator) Compensate(ctx workflow.Context) {
 	for _, v := range slices.Backward(c.fns) {
 		if err := v(ctx); err != nil {
