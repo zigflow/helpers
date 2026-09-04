@@ -196,13 +196,36 @@ func WithNoOp() Option {
 	}
 }
 
-func WithPrometheusMetrics(listenAddress, prefix string, registry *prom.Registry) Option {
+// WithPrometheusMetrics
+//
+// Convenience helper that creates a Prometheus metrics handler and attaches it
+// to the client options in a single call.
+//
+// By design, this does not expose the closer, so the metrics handler cannot be
+// shut down by the caller - that is the trade-off for the shorter call site. If
+// you need lifecycle control, create the handler yourself with
+// NewPrometheusHandler, defer its Close method, and pass it to WithMetrics:
+//
+//	metrics, err := temporal.NewPrometheusHandler(
+//		opts.temporal.MetricsListenAddress,
+//		opts.temporal.MetricsPrefix,
+//		nil,
+//	)
+//	if err != nil {
+//		return err
+//	}
+//	defer metrics.Close()
+//
+//	c, err := temporal.NewConnection(
+//		temporal.WithMetrics(metrics),
+//	)
+func WithPrometheusMetrics(listenAddress, prefix string, registry *prom.Registry, onError ...func(error)) Option {
 	return func(o *client.Options) error {
-		metrics, err := NewPrometheusHandler(listenAddress, prefix, registry)
+		h, err := NewPrometheusHandler(listenAddress, prefix, registry, onError...)
 		if err != nil {
 			return err
 		}
-		return WithMetrics(metrics)(o)
+		return WithMetrics(h)(o)
 	}
 }
 

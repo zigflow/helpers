@@ -18,6 +18,7 @@ package temporal
 
 import (
 	"fmt"
+	"io"
 	"time"
 
 	prom "github.com/prometheus/client_golang/prometheus"
@@ -28,18 +29,44 @@ import (
 	sdktally "go.temporal.io/sdk/contrib/tally"
 )
 
-func NewPrometheusHandler(listenAddress, prefix string, registry *prom.Registry) (client.MetricsHandler, error) {
+type PrometheusHandler struct {
+	client.MetricsHandler
+	closer io.Closer
+}
+
+func (h *PrometheusHandler) Close() error {
+	if h.closer == nil {
+		return nil
+	}
+
+	return h.closer.Close()
+}
+
+func NewPrometheusHandler(
+	listenAddress,
+	prefix string,
+	registry *prom.Registry,
+	onError ...func(error),
+) (*PrometheusHandler, error) {
 	c := prometheus.Configuration{
 		ListenAddress: listenAddress,
 		TimerType:     "histogram",
 	}
 
+	errorHandler := func(err error) {
+		log.Fatal().Err(err).Msg("Error in Prometheus reporter")
+	}
+	if len(onError) > 1 {
+		return nil, fmt.Errorf("only a single error handler may be supplied")
+	}
+	if len(onError) > 0 {
+		errorHandler = onError[0]
+	}
+
 	reporter, err := c.NewReporter(
 		prometheus.ConfigurationOptions{
 			Registry: registry,
-			OnError: func(err error) {
-				log.Fatal().Err(err).Msg("Error in Prometheus reporter")
-			},
+			OnError:  errorHandler,
 		},
 	)
 	if err != nil {
@@ -52,9 +79,12 @@ func NewPrometheusHandler(listenAddress, prefix string, registry *prom.Registry)
 		SanitizeOptions: &sdktally.PrometheusSanitizeOptions,
 		Prefix:          prefix,
 	}
-	scope, _ := tally.NewRootScope(scopeOpts, time.Second)
+	scope, closer := tally.NewRootScope(scopeOpts, time.Second)
 	scope = sdktally.NewPrometheusNamingScope(scope)
 
 	log.Info().Str("address", listenAddress).Msg("Starting Prometheus service")
-	return sdktally.NewMetricsHandler(scope), nil
+	return &PrometheusHandler{
+		MetricsHandler: sdktally.NewMetricsHandler(scope),
+		closer:         closer,
+	}, nil
 }
