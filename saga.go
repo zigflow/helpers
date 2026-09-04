@@ -31,13 +31,12 @@ import (
 //     failing.
 //  3. After each forward step succeeds, call [Compensator.Add] to register its
 //     undo.
-//  4. If the workflow returns an error, the deferred block compensates, running
-//     the registered functions in reverse order.
+//  4. If the workflow fails or is cancelled, the deferred block calls
+//     Compensate with the original workflow context, and the registered
+//     functions run in reverse order.
 //
-// Compensate uses whichever [workflow.Context] the caller passes it. It does
-// not create a disconnected context, so a workflow that has to compensate
-// after cancellation must create one itself with
-// [workflow.NewDisconnectedContext].
+// Compensate derives its own disconnected context, so callers never need
+// [workflow.NewDisconnectedContext] themselves.
 type Compensator struct {
 	fns []func(workflow.Context) error
 }
@@ -49,15 +48,24 @@ func (c *Compensator) Add(fn func(workflow.Context) error) {
 	c.fns = append(c.fns, fn)
 }
 
-// Compensate runs every registered compensation in reverse order, using ctx.
+// Compensate runs every registered compensation in reverse order.
 //
 // All of them are attempted even when one fails: a failure is logged through
 // the workflow logger and the next compensation still runs. Nothing is
-// returned, so the original workflow error is not masked.
+// returned, so the original workflow error is not replaced.
+//
+// Pass the original workflow context. Compensate derives a disconnected
+// context from it, which keeps the parent's configuration but not its
+// cancellation, so compensations still run for a workflow that is being
+// cancelled. That context is cancelled once Compensate returns, so a
+// compensation must complete its work before returning.
 func (c *Compensator) Compensate(ctx workflow.Context) {
+	disconnectedCtx, cancel := workflow.NewDisconnectedContext(ctx)
+	defer cancel()
+
 	for _, v := range slices.Backward(c.fns) {
-		if err := v(ctx); err != nil {
-			workflow.GetLogger(ctx).Error("compensation step failed", "error", err)
+		if err := v(disconnectedCtx); err != nil {
+			workflow.GetLogger(disconnectedCtx).Error("compensation step failed", "error", err)
 		}
 	}
 }

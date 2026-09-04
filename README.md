@@ -314,6 +314,10 @@ configured on the Zerolog logger still applies.
 compensation after its forward step has succeeded, and `Compensate` runs the
 registered functions in reverse order.
 
+Pass `Compensate` the original workflow context. It derives a disconnected
+context internally, so there is no need to call
+`workflow.NewDisconnectedContext` first.
+
 ```go
 func MyWorkflow(ctx workflow.Context) (err error) {
     var saga temporal.Compensator
@@ -323,9 +327,7 @@ func MyWorkflow(ctx workflow.Context) (err error) {
             return
         }
 
-        // Compensate on a disconnected context so the compensations still run
-        // if the workflow was cancelled
-        saga.Compensate(workflow.NewDisconnectedContext(ctx))
+        saga.Compensate(ctx)
     }()
 
     if err = workflow.ExecuteActivity(ctx, CreateOrder).Get(ctx, nil); err != nil {
@@ -348,11 +350,12 @@ func MyWorkflow(ctx workflow.Context) (err error) {
 
 Every registered compensation is attempted even when one fails: the failure is
 logged through the workflow logger and the next compensation still runs.
-`Compensate` returns nothing, so the original workflow error is not masked.
+`Compensate` returns nothing, so the original workflow error is not replaced.
 
-`Compensate` uses whichever `workflow.Context` the caller gives it. It does not
-create a disconnected context itself, which is why the example above creates
-one at the call site.
+The disconnected context keeps the parent's configuration, such as activity
+options, but not its cancellation, so compensations still run for a workflow
+that is being cancelled. It is cancelled once `Compensate` returns, so a
+compensation must complete its work before returning.
 
 ## Go compatibility
 

@@ -17,12 +17,16 @@
 package temporal
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.temporal.io/sdk/activity"
+	sdktemporal "go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/workflow"
 )
@@ -33,6 +37,23 @@ const (
 	stepSecond = "second"
 	stepThird  = "third"
 )
+
+// undoActivityName is the registered name of the activity the compensations
+// run, so that a compensation is proved to have done real workflow work rather
+// than merely to have been called.
+const undoActivityName = "undo"
+
+// compensationTaskQueue is a non-default task queue put on the parent context's
+// activity options. An activity that reports running on it proves the context
+// Compensate builds inherited the parent's configuration.
+const compensationTaskQueue = "compensation-queue"
+
+// undoActivity reports the step it undid alongside the task queue it ran on, so
+// the workflow can assert both that the compensation completed and which
+// activity options it ran with.
+func undoActivity(ctx context.Context, step string) (string, error) {
+	return step + "@" + activity.GetInfo(ctx).TaskQueue, nil
+}
 
 // recorder collects the order in which compensations ran.
 type recorder struct {
@@ -146,33 +167,89 @@ func TestCompensator(t *testing.T) {
 	}
 }
 
-func TestCompensatorPassesTheWorkflowContext(t *testing.T) {
-	var (
-		received []workflow.Context
-		given    workflow.Context
-	)
+// TestCompensatorCompensatesAfterTheParentContextIsCancelled covers the
+// disconnected context Compensate builds, by observable behaviour rather than by
+// comparing contexts.
+//
+// The context handed to Compensate is cancelled first, and the same activity
+// call is made twice: once on that cancelled context, where it must fail, and
+// once from inside each compensation, where it must complete. Activity options
+// are only ever set on the parent, before cancellation, and carry a non-default
+// task queue, so an activity that completes at all also proves the compensation
+// context inherited the parent's configuration.
+func TestCompensatorCompensatesAfterTheParentContextIsCancelled(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
 
-	runInWorkflow(t, func(ctx workflow.Context) {
+	env := suite.NewTestWorkflowEnvironment()
+	env.RegisterActivityWithOptions(undoActivity, activity.RegisterOptions{Name: undoActivityName})
+
+	rec := &recorder{}
+
+	// parentErr is the result of using the cancelled context directly. It is
+	// what makes the compensations' success meaningful.
+	var parentErr error
+
+	env.RegisterWorkflowWithOptions(func(ctx workflow.Context) error {
+		ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+			StartToCloseTimeout: time.Minute,
+			TaskQueue:           compensationTaskQueue,
+		})
+
+		cancellableCtx, cancel := workflow.WithCancel(ctx)
+
 		var c Compensator
 
-		for range 2 {
+		for _, step := range []string{stepFirst, stepSecond} {
 			c.Add(func(compensationCtx workflow.Context) error {
-				received = append(received, compensationCtx)
+				var undone string
+
+				// No activity options are set here: whatever the compensation
+				// runs with has to have come from the parent context.
+				if err := workflow.ExecuteActivity(compensationCtx, undoActivityName, step).
+					Get(compensationCtx, &undone); err != nil {
+					return err
+				}
+
+				rec.record(undone)
 
 				return nil
 			})
 		}
 
-		given = ctx
-		c.Compensate(ctx)
-	})
+		// Cancel the context Compensate is given, standing in for a workflow
+		// that is being cancelled.
+		cancel()
 
-	require.Len(t, received, 2)
+		parentErr = workflow.ExecuteActivity(cancellableCtx, undoActivityName, "parent").
+			Get(cancellableCtx, nil)
 
-	for i, ctx := range received {
-		assert.Equal(t, given, ctx, "compensation %d should be given the context passed to Compensate", i)
-		assert.NotNil(t, workflow.GetInfo(ctx), "the context should be a usable workflow context")
-	}
+		c.Compensate(cancellableCtx)
+
+		return nil
+	}, workflow.RegisterOptions{Name: "compensator-cancelled-parent"})
+
+	env.ExecuteWorkflow("compensator-cancelled-parent")
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+
+	require.Error(t, parentErr, "the context given to Compensate must really be cancelled")
+	assert.True(
+		t,
+		sdktemporal.IsCanceledError(parentErr),
+		"the parent context should fail activities with a cancellation error, got %v", parentErr,
+	)
+
+	assert.Equal(
+		t,
+		[]string{
+			stepSecond + "@" + compensationTaskQueue,
+			stepFirst + "@" + compensationTaskQueue,
+		},
+		rec.recorded(),
+		"every compensation should run its activity to completion, in LIFO order, "+
+			"on the parent's activity options",
+	)
 }
 
 // TestCompensatorZeroValue proves a Compensator needs no construction.
