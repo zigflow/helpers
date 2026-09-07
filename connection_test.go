@@ -74,6 +74,36 @@ type stubLogger struct {
 	name string
 }
 
+// stubStorageDriver is a do-nothing storage driver that is identifiable by name,
+// so a test can prove which drivers reached the client options.
+type stubStorageDriver struct {
+	converter.StorageDriver
+
+	name string
+}
+
+func (s stubStorageDriver) Name() string { return s.name }
+
+// stubDriverSelector is a do-nothing storage driver selector that is
+// identifiable by name.
+type stubDriverSelector struct {
+	converter.StorageDriverSelector
+
+	name string
+}
+
+// stubFactory returns an ExternalConfigFactory that reports the given drivers
+// and error, alongside a count of how many times it has been called.
+func stubFactory(drivers []converter.StorageDriver, err error) (factory ExternalConfigFactory, calls *int) {
+	count := 0
+
+	return func() ([]converter.StorageDriver, error) {
+		count++
+
+		return drivers, err
+	}, &count
+}
+
 func TestWithHostPort(t *testing.T) {
 	t.Parallel()
 
@@ -328,6 +358,73 @@ func TestWithExternalStorage(t *testing.T) {
 	o := mustApplyOptions(t, WithExternalStorage(storage))
 
 	assert.Equal(t, storage, o.ExternalStorage)
+}
+
+func TestWithExternalStorageFactory(t *testing.T) {
+	t.Parallel()
+
+	// A slice the tests can recognise again, so that a driver list built from
+	// anything other than the factory's return value would be spotted.
+	drivers := []converter.StorageDriver{
+		stubStorageDriver{name: "first"},
+		stubStorageDriver{name: "second"},
+	}
+
+	t.Run("the factory result and the config are passed to the client options", func(t *testing.T) {
+		t.Parallel()
+
+		factory, calls := stubFactory(drivers, nil)
+		selector := stubDriverSelector{name: "selector"}
+
+		o := mustApplyOptions(t, WithExternalStorageFactory(ExternalConfig{
+			Factory:               factory,
+			PayloadSizeThreshold:  4096,
+			StorageDriverSelector: selector,
+		}))
+
+		assert.Equal(t, drivers, o.ExternalStorage.Drivers)
+		assert.Equal(t, selector, o.ExternalStorage.DriverSelector)
+		assert.Equal(t, 4096, o.ExternalStorage.PayloadSizeThreshold)
+		assert.Equal(t, 1, *calls, "the factory should be invoked exactly once")
+	})
+
+	t.Run("the factory is only invoked once the option is applied", func(t *testing.T) {
+		t.Parallel()
+
+		factory, calls := stubFactory(drivers, nil)
+
+		option := WithExternalStorageFactory(ExternalConfig{Factory: factory})
+
+		require.Zero(t, *calls, "building the option should not invoke the factory")
+
+		_, err := applyOptions(t, option)
+
+		require.NoError(t, err)
+		assert.Equal(t, 1, *calls)
+	})
+
+	t.Run("a config without a factory is an error", func(t *testing.T) {
+		t.Parallel()
+
+		o, err := applyOptions(t, WithExternalStorageFactory(ExternalConfig{
+			PayloadSizeThreshold: 4096,
+		}))
+
+		assert.EqualError(t, err, "external storage factory must have a factory defined")
+		assert.Equal(t, client.Options{}, *o, "a rejected config should leave the client options alone")
+	})
+
+	t.Run("factory errors are wrapped", func(t *testing.T) {
+		t.Parallel()
+
+		factory, _ := stubFactory(drivers, errBoom)
+
+		o, err := applyOptions(t, WithExternalStorageFactory(ExternalConfig{Factory: factory}))
+
+		assert.ErrorIs(t, err, errBoom, "the cause should survive the wrapping")
+		assert.ErrorContains(t, err, "error invoking external storage factory")
+		assert.Equal(t, client.Options{}, *o, "a failed factory should leave the client options alone")
+	})
 }
 
 func TestWithLogger(t *testing.T) {

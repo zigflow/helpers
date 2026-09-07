@@ -166,6 +166,35 @@ func WithExternalStorage(st converter.ExternalStorage) Option {
 	}
 }
 
+// WithExternalStorageFactory sets the external storage from an [ExternalConfig]
+// by invoking e.Factory and handing the drivers it returns to
+// [WithExternalStorage], together with e.StorageDriverSelector and
+// e.PayloadSizeThreshold.
+//
+// The factory runs when the option is applied rather than when it is built, so
+// building an option never talks to the storage backend. An [ExternalConfig]
+// without a Factory is an error, and so is a factory that fails; a failing
+// factory's error is wrapped rather than returned as it is, so the cause is
+// still reachable with [errors.Is] and [errors.As].
+func WithExternalStorageFactory(e ExternalConfig) Option {
+	return func(o *client.Options) error {
+		if e.Factory == nil {
+			return fmt.Errorf("external storage factory must have a factory defined")
+		}
+
+		drivers, err := e.Factory()
+		if err != nil {
+			return fmt.Errorf("error invoking external storage factory: %w", err)
+		}
+
+		return WithExternalStorage(converter.ExternalStorage{
+			Drivers:              drivers,
+			DriverSelector:       e.StorageDriverSelector,
+			PayloadSizeThreshold: e.PayloadSizeThreshold,
+		})(o)
+	}
+}
+
 // WithFailureConverter sets a failure converter that encodes failures with cvt.
 // Common failure attributes, such as the message and stack trace, are encoded
 // too, so a converter that encrypts payloads also covers failure detail.

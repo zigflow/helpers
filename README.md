@@ -12,6 +12,7 @@ holding the pieces that tend to be rewritten in every service.
 * [Connection](#connection)
   * [TLS](#tls)
 * [Authentication](#authentication)
+* [External storage](#external-storage)
 * [Environment configuration](#environment-configuration)
 * [Cobra/Viper integration](#cobraviper-integration)
 * [Health checks](#health-checks)
@@ -37,6 +38,7 @@ applications:
 
 * client connection configuration
 * authentication and TLS
+* external storage for large payloads
 * Cobra/Viper CLI integration
 * health and readiness endpoints
 * Prometheus metrics
@@ -118,6 +120,62 @@ method:
 1. an API key, when `apiKey` is supplied
 2. mTLS, when both the certificate and the key are supplied
 3. otherwise no authentication option is applied
+
+## External storage
+
+Payloads too large to send to the Temporal server inline can be offloaded to
+external storage, leaving only a reference in the workflow history.
+`ExternalConfigS3Factory` builds an S3-backed storage driver, and
+`WithExternalStorageFactory` attaches it to a connection:
+
+```go
+c, err := temporal.NewConnection(
+    temporal.WithExternalStorageFactory(temporal.ExternalConfig{
+        PayloadSizeThreshold: 1024 * 1024,
+        Factory: temporal.ExternalConfigS3Factory(ctx, &temporal.S3Config{
+            Bucket: "my-payload-bucket",
+            Region: "eu-west-2",
+        }),
+    }),
+)
+```
+
+The factory runs when the option is applied rather than when it is built, so
+an AWS configuration that cannot be loaded is reported as an error from
+`NewConnection`. An `ExternalConfig` without a `Factory` is an error too.
+
+`Bucket` and `Region` are the only `S3Config` fields most deployments need.
+The rest are optional, and only matter for credentials the AWS SDK cannot
+resolve on its own, for S3-compatible storage, or to override a driver
+default:
+
+* `AccessKeyID` and `SecretAccessKey` set static credentials. Leave both empty
+  to use the AWS default credential chain, which covers the environment,
+  shared configuration files, and instance or workload identity.
+* `SessionToken` accompanies temporary credentials. It may only be set
+  alongside both `AccessKeyID` and `SecretAccessKey`; on its own, or with only
+  one of them, it is reported as an error.
+* `Endpoint` points at an S3-compatible service such as MinIO or LocalStack.
+  An empty endpoint uses whichever AWS endpoint the SDK resolves for the
+  region.
+* `UsePathStyle` addresses the bucket in the request path rather than in the
+  hostname, which S3-compatible services usually require.
+* `DriverName` names the driver, defaulting to `aws.s3driver`. Every driver
+  attached to a client needs a unique name, so this is only needed when more
+  than one is registered.
+* `MaxPayloadSize` is the largest payload the driver accepts, defaulting to
+  50 MiB. Anything above it is reported as an error rather than stored.
+
+`ExternalConfig` carries the settings that apply whatever the backend:
+
+* `PayloadSizeThreshold` is the serialized payload size, in bytes, at which a
+  payload is offloaded instead of being sent inline. Zero uses the SDK default
+  of 256 KiB.
+* `StorageDriverSelector` routes each payload to a particular driver, or
+  leaves it inline. When it is nil, the first driver stores every payload over
+  the threshold.
+
+This is experimental, following the status of the underlying SDK support.
 
 ## Environment configuration
 
