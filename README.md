@@ -1,4 +1,4 @@
-# helpers
+# Helpers
 
 A collection of Temporal helpers
 
