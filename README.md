@@ -23,6 +23,7 @@ holding the pieces that tend to be rewritten in every service.
 * [Logging](#logging)
   * [Zerolog](#zerolog)
   * [slog](#slog)
+  * [Zap](#zap)
 * [Saga compensation](#saga-compensation)
 * [Go compatibility](#go-compatibility)
 * [Contributing](#contributing)
@@ -389,6 +390,27 @@ c, err := temporal.NewConnectionWithEnvvars(
 
 As with Zerolog, levels and structured key/value pairs are passed through, and
 the level configured on the `slog.Handler` still applies.
+
+### Zap
+
+Zap needs no adapter from this package either. `zapslog`, from
+`go.uber.org/zap/exp/zapslog`, bridges a `*zap.Logger`'s `Core` into a
+`slog.Handler`, and the SDK's own `log.NewStructuredLogger` takes it from
+there:
+
+```go
+// pkg/logger/logger.go
+zapLogger, _ := zap.NewProduction()
+handler := zapslog.NewHandler(zapLogger.Core())
+logger := log.NewStructuredLogger(slog.New(handler))
+
+c, err := temporal.NewConnectionWithEnvvars(
+    temporal.WithLogger(logger),
+)
+```
+
+Levels and structured key/value pairs are passed through, and the level
+configured on the `zapcore.Core` still applies.
 
 ## Saga compensation
 
