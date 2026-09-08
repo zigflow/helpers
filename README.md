@@ -21,6 +21,8 @@ holding the pieces that tend to be rewritten in every service.
   * [Convenience usage](#convenience-usage)
   * [Error handling](#error-handling)
 * [Logging](#logging)
+  * [Zerolog](#zerolog)
+  * [slog](#slog)
 * [Saga compensation](#saga-compensation)
 * [Go compatibility](#go-compatibility)
 * [Contributing](#contributing)
@@ -354,6 +356,8 @@ once the reporter is running.
 
 ## Logging
 
+### Zerolog
+
 `NewZerologHandler` adapts a Zerolog logger to the SDK's logger interface, and
 `WithZerolog` applies one directly to a connection:
 
@@ -365,6 +369,26 @@ c, err := temporal.NewConnection(
 
 Levels and structured key/value pairs are passed through, and the level
 configured on the Zerolog logger still applies.
+
+### slog
+
+Unlike Zerolog, `log/slog` needs no adapter from this package. The SDK ships
+`log.NewStructuredLogger` in `go.temporal.io/sdk/log`, which already turns an
+`*slog.Logger` into an SDK logger, so it is passed straight to `WithLogger`:
+
+```go
+// pkg/logger/logger.go
+logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+    Level: slog.LevelDebug,
+}))
+
+c, err := temporal.NewConnectionWithEnvvars(
+    temporal.WithLogger(log.NewStructuredLogger(logger)),
+)
+```
+
+As with Zerolog, levels and structured key/value pairs are passed through, and
+the level configured on the `slog.Handler` still applies.
 
 ## Saga compensation
 

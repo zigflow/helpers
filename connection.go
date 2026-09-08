@@ -340,12 +340,6 @@ func WithTLS(enabled bool, tlsOpts ...TLSOption) Option {
 	}
 }
 
-// WithZerolog uses an existing Zerolog logger as the client logger. It is
-// shorthand for [WithLogger] with [NewZerologHandler].
-func WithZerolog(logger *zerolog.Logger) Option {
-	return WithLogger(NewZerologHandler(logger))
-}
-
 // WithTLSServerName overrides the TLS server name (SNI) used to validate the
 // server certificate. It is needed when the endpoint address does not match the
 // certificate hostname, for example behind AWS PrivateLink. An empty serverName
@@ -358,4 +352,10 @@ func WithTLSServerName(serverName string) TLSOption {
 		c.ServerName = serverName
 		return nil
 	}
+}
+
+// WithZerolog uses an existing Zerolog logger as the client logger. It is
+// shorthand for [WithLogger] with [NewZerologHandler].
+func WithZerolog(logger *zerolog.Logger) Option {
+	return WithLogger(NewZerologHandler(logger))
 }
