@@ -25,8 +25,10 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/contrib/envconfig"
 	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/interceptor"
 	"go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/workflow"
 )
 
 // Option configures a [client.Options] before the connection is dialled.
@@ -120,6 +122,24 @@ func WithConnectionOptions(connection *client.ConnectionOptions) Option {
 		if connection.TLS == nil {
 			o.ConnectionOptions.TLS = tlsConfig
 		}
+		return nil
+	}
+}
+
+// WithContextPropagators sets the context propagators used to carry values
+// between the client, workflows and activities, for example a trace or tenant
+// identifier held in the caller's [context.Context].
+//
+// The whole set is replaced rather than added to, so a later call overwrites an
+// earlier one; pass every propagator in a single call. A nil or empty slice
+// leaves no propagators configured.
+//
+// Propagators run in the order they are given, and the same set must be given
+// to every client and worker that takes part, otherwise a value injected at one
+// end is not extracted at the other.
+func WithContextPropagators(propagators []workflow.ContextPropagator) Option {
+	return func(o *client.Options) error {
+		o.ContextPropagators = propagators
 		return nil
 	}
 }
@@ -218,6 +238,24 @@ func WithHostPort(hostPort string) Option {
 			hostPort = client.DefaultHostPort
 		}
 		o.HostPort = hostPort
+		return nil
+	}
+}
+
+// WithInterceptors sets the interceptors applied to client calls, such as
+// starting a workflow or sending a signal.
+//
+// Earlier interceptors wrap later ones, so the first one given is the
+// outermost. The whole set is replaced rather than added to, so a later call
+// overwrites an earlier one; pass every interceptor in a single call. A nil or
+// empty slice leaves no interceptors configured.
+//
+// An interceptor that also implements [interceptor.WorkerInterceptor] is used
+// for worker interception as well, wrapping any interceptor set in the worker's
+// own options. The same interceptor should not be given in both places.
+func WithInterceptors(interceptors []interceptor.ClientInterceptor) Option {
+	return func(o *client.Options) error {
+		o.Interceptors = interceptors
 		return nil
 	}
 }

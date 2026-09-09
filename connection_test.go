@@ -26,7 +26,9 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/interceptor"
 	"go.temporal.io/sdk/log"
+	"go.temporal.io/sdk/workflow"
 )
 
 // errBoom is a sentinel used to prove errors are propagated unchanged.
@@ -70,6 +72,23 @@ type stubMetricsHandler struct {
 // stubLogger is a do-nothing Temporal logger that is identifiable by name.
 type stubLogger struct {
 	log.Logger
+
+	name string
+}
+
+// stubClientInterceptor is a do-nothing client interceptor that is identifiable
+// by name, so a test can prove which interceptors reached the client options,
+// and in which order.
+type stubClientInterceptor struct {
+	interceptor.ClientInterceptor
+
+	name string
+}
+
+// stubContextPropagator is a do-nothing context propagator that is identifiable
+// by name.
+type stubContextPropagator struct {
+	workflow.ContextPropagator
 
 	name string
 }
@@ -425,6 +444,73 @@ func TestWithExternalStorageFactory(t *testing.T) {
 		assert.ErrorContains(t, err, "error invoking external storage factory")
 		assert.Equal(t, client.Options{}, *o, "a failed factory should leave the client options alone")
 	})
+}
+
+// assertSliceOption proves that a slice-valued option hands the supplied slice
+// to the client options as it is, and that a later call replaces the whole set
+// rather than adding to it. It is shared by the interceptor and context
+// propagator options, which have the same replacement semantics.
+func assertSliceOption[T any](
+	t *testing.T,
+	option func([]T) Option,
+	field func(*client.Options) []T,
+	original, replacement []T,
+) {
+	t.Helper()
+
+	t.Run("the supplied slice reaches the client options in order", func(t *testing.T) {
+		t.Parallel()
+
+		o := mustApplyOptions(t, option(original))
+
+		assert.Equal(t, original, field(o))
+	})
+
+	t.Run("a nil slice leaves nothing configured", func(t *testing.T) {
+		t.Parallel()
+
+		o := mustApplyOptions(t, option(nil))
+
+		assert.Nil(t, field(o))
+	})
+
+	t.Run("a later call replaces the whole set", func(t *testing.T) {
+		t.Parallel()
+
+		o := mustApplyOptions(t, option(original), option(replacement))
+
+		assert.Equal(t, replacement, field(o))
+	})
+}
+
+func TestWithContextPropagators(t *testing.T) {
+	t.Parallel()
+
+	assertSliceOption(
+		t,
+		WithContextPropagators,
+		func(o *client.Options) []workflow.ContextPropagator { return o.ContextPropagators },
+		[]workflow.ContextPropagator{
+			stubContextPropagator{name: "trace"},
+			stubContextPropagator{name: "tenant"},
+		},
+		[]workflow.ContextPropagator{stubContextPropagator{name: "replacement"}},
+	)
+}
+
+func TestWithInterceptors(t *testing.T) {
+	t.Parallel()
+
+	assertSliceOption(
+		t,
+		WithInterceptors,
+		func(o *client.Options) []interceptor.ClientInterceptor { return o.Interceptors },
+		[]interceptor.ClientInterceptor{
+			stubClientInterceptor{name: "outermost"},
+			stubClientInterceptor{name: "innermost"},
+		},
+		[]interceptor.ClientInterceptor{stubClientInterceptor{name: "replacement"}},
+	)
 }
 
 func TestWithLogger(t *testing.T) {

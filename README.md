@@ -12,6 +12,7 @@ holding the pieces that tend to be rewritten in every service.
 * [Connection](#connection)
   * [TLS](#tls)
 * [Authentication](#authentication)
+* [Interceptors and context propagators](#interceptors-and-context-propagators)
 * [External storage](#external-storage)
 * [Environment configuration](#environment-configuration)
 * [Cobra/Viper integration](#cobraviper-integration)
@@ -41,6 +42,7 @@ applications:
 
 * client connection configuration
 * authentication and TLS
+* interceptors and context propagators
 * external storage for large payloads
 * Cobra/Viper CLI integration
 * health and readiness endpoints
@@ -123,6 +125,41 @@ method:
 1. an API key, when `apiKey` is supplied
 2. mTLS, when both the certificate and the key are supplied
 3. otherwise no authentication option is applied
+
+## Interceptors and context propagators
+
+`WithInterceptors` sets the interceptors applied to client calls, such as
+starting a workflow or sending a signal, and `WithContextPropagators` sets the
+propagators that carry values between the client, workflows and activities, for
+example a trace or tenant identifier held in the caller's `context.Context`.
+
+```go
+c, err := temporal.NewConnection(
+    temporal.WithInterceptors([]interceptor.ClientInterceptor{
+        tracingInterceptor,
+    }),
+    temporal.WithContextPropagators([]workflow.ContextPropagator{
+        tenantPropagator,
+    }),
+)
+```
+
+Both options replace the whole set rather than adding to it, so a later call
+overwrites an earlier one - pass everything in a single call. A nil or empty
+slice leaves nothing configured.
+
+Order within the slice matters:
+
+* earlier interceptors wrap later ones, so the first one given is the outermost
+* propagators are invoked in the order they are given
+
+An interceptor that also implements `interceptor.WorkerInterceptor` is used for
+worker interception as well, wrapping any interceptor set in the worker's own
+options. The same interceptor should not be given in both places.
+
+Context propagators only carry a value end to end when the same set is
+configured on every client and worker that takes part, otherwise a value
+injected at one end is not extracted at the other.
 
 ## External storage
 
