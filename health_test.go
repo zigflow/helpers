@@ -683,6 +683,32 @@ func TestNewHealthCheck(t *testing.T) {
 		assert.JSONEq(t, `{"healthy":true}`, body, "the fake client reports a healthy Temporal")
 	})
 
+	t.Run("port 0 serves on an assigned port and logs it", func(t *testing.T) {
+		logs := captureLogs(t)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		require.NoError(t, NewHealthCheck(ctx, []string{testTaskQueue}, "127.0.0.1:0", newFakeTemporalClient()))
+
+		// NewHealthCheck does not return the address, so the log is the only
+		// way to find the port the OS assigned.
+		entry := logs.waitForMessage(t, "Starting healthcheck service")
+		address := requireAssignedAddress(t, entry, "127.0.0.1")
+		assert.InDelta(t, 1, entry["taskQueueCount"], 0)
+
+		httpClient := newTestHTTPClient(t)
+
+		status, body, err := getLiveness(t, httpClient, address)
+		require.NoError(t, err, "the healthcheck serves on the logged address")
+		assert.Equal(t, http.StatusOK, status)
+		assert.JSONEq(t, `{"healthy":true}`, body)
+
+		cancel()
+
+		requireNotServing(t, httpClient, address)
+	})
+
 	t.Run("shuts down when the context is cancelled", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()

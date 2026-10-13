@@ -17,8 +17,12 @@
 package temporal
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"time"
 
 	prom "github.com/prometheus/client_golang/prometheus"
@@ -37,18 +41,39 @@ import (
 // handler, and is responsible for calling [PrometheusHandler.Close].
 type PrometheusHandler struct {
 	client.MetricsHandler
-	closer io.Closer
+	closer   io.Closer
+	server   *http.Server
+	listener net.Listener
 }
 
-// Close flushes and releases the underlying Tally scope, and reports whatever
-// the scope reports. A handler with no scope to release, such as the zero
-// value, closes without error.
+// Close stops the owned HTTP server and listener, then flushes and releases the
+// underlying Tally scope. It returns any errors encountered during cleanup.
+// The zero value closes without error. An endpoint registered on Go's default
+// HTTP mux remains registered.
 func (h *PrometheusHandler) Close() error {
-	if h.closer == nil {
-		return nil
+	var errs []error
+
+	if h.server != nil {
+		if err := h.server.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
-	return h.closer.Close()
+	// Also close the listener directly in case Close was called before
+	// the Serve goroutine registered it with the HTTP server.
+	if h.listener != nil {
+		if err := h.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
+
+	if h.closer != nil {
+		if err := h.closer.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 // NewPrometheusHandler creates a Prometheus-backed metrics handler for a
@@ -56,9 +81,11 @@ func (h *PrometheusHandler) Close() error {
 // [PrometheusHandler.Close] when it is no longer needed, usually with defer.
 //
 // Metrics are served on listenAddress under /metrics, with prefix prepended to
-// every metric name. An empty listenAddress attaches the metrics endpoint to
-// Go's default HTTP mux instead of starting a server of its own. A nil registry
-// uses the Prometheus default registry. Timers are reported as histograms.
+// every metric name. A port of 0 (for example "0.0.0.0:0") lets the OS pick a
+// free port, which is logged. An empty listenAddress attaches the metrics
+// endpoint to Go's default HTTP mux instead of starting a server of its own. A
+// nil registry uses the Prometheus default registry. Timers are reported as
+// histograms.
 //
 // The optional onError argument decides how the reporter reports its own
 // failures:
@@ -69,20 +96,14 @@ func (h *PrometheusHandler) Close() error {
 //     behaviour applies
 //   - more than one: an error is returned and no handler is created
 //
-// Reporter failures are not returned from here. A listen address that cannot be
-// bound, for example, is reported asynchronously through onError once the
-// reporter is running.
+// Listen failures are returned synchronously. Metric registration and unexpected
+// HTTP serving failures are reported through onError.
 func NewPrometheusHandler(
 	listenAddress,
 	prefix string,
 	registry *prom.Registry,
 	onError ...func(error),
 ) (*PrometheusHandler, error) {
-	c := prometheus.Configuration{
-		ListenAddress: listenAddress,
-		TimerType:     "histogram",
-	}
-
 	errorHandler := func(err error) {
 		log.Fatal().Err(err).Msg("Error in Prometheus reporter")
 	}
@@ -93,14 +114,35 @@ func NewPrometheusHandler(
 		errorHandler = onError[0]
 	}
 
-	reporter, err := c.NewReporter(
-		prometheus.ConfigurationOptions{
-			Registry: registry,
-			OnError:  errorHandler,
-		},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("error creating reporter: %w", err)
+	reporterOpts := prometheus.Options{
+		DefaultTimerType: prometheus.HistogramTimerType,
+		OnRegisterError:  errorHandler,
+	}
+	if registry != nil {
+		reporterOpts.Registerer = registry
+		reporterOpts.Gatherer = registry
+	}
+
+	reporter := prometheus.NewReporter(reporterOpts)
+
+	var listener net.Listener
+	var server *http.Server
+
+	if listenAddress == "" {
+		http.Handle("/metrics", reporter.HTTPHandler())
+	} else {
+		var err error
+		listener, err = (&net.ListenConfig{}).Listen(context.Background(), "tcp", listenAddress)
+		if err != nil {
+			return nil, fmt.Errorf("error listening for Prometheus: %w", err)
+		}
+
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", reporter.HTTPHandler())
+		server = &http.Server{
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
 	}
 
 	scopeOpts := tally.ScopeOptions{
@@ -112,9 +154,25 @@ func NewPrometheusHandler(
 	scope, closer := tally.NewRootScope(scopeOpts, time.Second)
 	scope = sdktally.NewPrometheusNamingScope(scope)
 
-	log.Info().Str("address", listenAddress).Msg("Starting Prometheus service")
-	return &PrometheusHandler{
+	handler := &PrometheusHandler{
 		MetricsHandler: sdktally.NewMetricsHandler(scope),
 		closer:         closer,
-	}, nil
+		server:         server,
+		listener:       listener,
+	}
+
+	if server != nil {
+		log.Info().Str("address", listener.Addr().String()).Msg("Starting Prometheus service")
+
+		go func() {
+			if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				if errorHandler == nil {
+					panic(err)
+				}
+				errorHandler(err)
+			}
+		}()
+	}
+
+	return handler, nil
 }

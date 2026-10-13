@@ -23,14 +23,20 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/client"
@@ -153,4 +159,105 @@ func writeFile(t *testing.T, name, content string) string {
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 
 	return path
+}
+
+// logWaitTimeout bounds how long a test waits for a log entry written from
+// another goroutine. It only exists so a broken implementation fails rather than
+// hangs.
+const logWaitTimeout = 5 * time.Second
+
+// logCapture records the JSON entries written by a zerolog logger. It is mutex
+// guarded because servers log from their own goroutines.
+type logCapture struct {
+	mu      sync.Mutex
+	entries []map[string]any
+	// written is signalled after every entry, so waiters never poll.
+	written chan struct{}
+}
+
+func (c *logCapture) Write(p []byte) (int, error) {
+	entry := map[string]any{}
+	if err := json.Unmarshal(p, &entry); err != nil {
+		return 0, err
+	}
+
+	c.mu.Lock()
+	c.entries = append(c.entries, entry)
+	c.mu.Unlock()
+
+	select {
+	case c.written <- struct{}{}:
+	default:
+	}
+
+	return len(p), nil
+}
+
+func (c *logCapture) find(message string) (map[string]any, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, entry := range c.entries {
+		if entry[zerolog.MessageFieldName] == message {
+			return entry, true
+		}
+	}
+
+	return nil, false
+}
+
+// waitForMessage returns the first entry with the given message, waiting a
+// bounded time for it to be written.
+func (c *logCapture) waitForMessage(t *testing.T, message string) map[string]any {
+	t.Helper()
+
+	timeout := time.NewTimer(logWaitTimeout)
+	defer timeout.Stop()
+
+	for {
+		if entry, ok := c.find(message); ok {
+			return entry
+		}
+
+		select {
+		case <-c.written:
+		case <-timeout.C:
+			t.Fatalf("no %q log entry after %s", message, logWaitTimeout)
+		}
+	}
+}
+
+// captureLogs swaps the global zerolog logger for one that records its entries
+// and restores the original when the test finishes. Loggers derived from the
+// global one before the swap is undone keep writing to the capture, so entries
+// logged from a goroutine are still recorded. Callers must not be parallel.
+func captureLogs(t *testing.T) *logCapture {
+	t.Helper()
+
+	original := log.Logger
+	t.Cleanup(func() { log.Logger = original })
+
+	c := &logCapture{written: make(chan struct{}, 1)}
+	log.Logger = zerolog.New(c)
+
+	return c
+}
+
+// requireAssignedAddress asserts that a logged address is on the expected host
+// with a real, OS-assigned port rather than 0, and returns it.
+func requireAssignedAddress(t *testing.T, entry map[string]any, expectedHost string) string {
+	t.Helper()
+
+	address, ok := entry["address"].(string)
+	require.True(t, ok, "the log entry has an address: %v", entry)
+
+	host, port, err := net.SplitHostPort(address)
+	require.NoError(t, err)
+	assert.Equal(t, expectedHost, host)
+
+	p, err := strconv.Atoi(port)
+	require.NoError(t, err)
+	require.NotZero(t, p, "the logged port is the assigned one, not 0")
+
+	return address
 }

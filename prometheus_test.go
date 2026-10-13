@@ -21,11 +21,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -43,11 +45,9 @@ const freeListenAddress = "127.0.0.1:0"
 // selects which failure that child triggers.
 const promFatalEnv = "TEMPORAL_HELPERS_TEST_PROMETHEUS_FATAL"
 
-// The failures the fatal child process can trigger.
-const (
-	fatalModeListen   = "listen"
-	fatalModeRegister = "register"
-)
+// fatalModeRegister selects the registration failure in the fatal child
+// process.
+const fatalModeRegister = "register"
 
 // Names used by the error handler tests. The metric is registered up front by
 // the test so that tally's own registration of the same name fails.
@@ -60,8 +60,98 @@ const (
 // more than one error handler.
 const errorHandlerMessage = "only a single error handler may be supplied"
 
-// metricsPath is the path tally registers its handler on.
+// metricsPath is the path the metrics handler is served on.
 const metricsPath = "/metrics"
+
+// prometheusStartMessage is logged by NewPrometheusHandler when it starts a
+// server of its own.
+const prometheusStartMessage = "Starting Prometheus service"
+
+// newTestPrometheusHandler builds a handler, failing the test if that does not
+// work, and closes it when the test finishes. Tests that assert on Close call it
+// themselves; the cleanup is only a backstop.
+func newTestPrometheusHandler(
+	t *testing.T,
+	listenAddress, prefix string,
+	registry *prom.Registry,
+	onError ...func(error),
+) *PrometheusHandler {
+	t.Helper()
+
+	handler, err := NewPrometheusHandler(listenAddress, prefix, registry, onError...)
+	require.NoError(t, err)
+	require.NotNil(t, handler)
+
+	t.Cleanup(func() { _ = handler.Close() })
+
+	return handler
+}
+
+// startExplicitPrometheusHandler starts a handler on an explicit loopback port,
+// moving to a different port if the one it picked was claimed in the meantime.
+// An explicit port has to be known before the handler binds it, so this follows
+// the same pick-and-retry approach as startHealthCheck. Any error other than
+// "address already in use" fails the test immediately.
+func startExplicitPrometheusHandler(
+	t *testing.T,
+	prefix string,
+	registry *prom.Registry,
+	onError func(error),
+) (handler *PrometheusHandler, address string) {
+	t.Helper()
+
+	for range maxAddressAttempts {
+		address = freeLoopbackAddress(t)
+
+		handler, err := NewPrometheusHandler(address, prefix, registry, onError)
+		if err == nil {
+			t.Cleanup(func() { _ = handler.Close() })
+
+			return handler, address
+		}
+
+		require.ErrorIs(t, err, syscall.EADDRINUSE, "unexpected error starting the Prometheus handler")
+	}
+
+	t.Fatalf("no free loopback port found after %d attempts", maxAddressAttempts)
+
+	return nil, ""
+}
+
+// getMetrics fetches /metrics from address and returns the body. The listener
+// is bound before NewPrometheusHandler returns, so the request is accepted even
+// if the server has not been scheduled yet and no retry is needed.
+func getMetrics(t *testing.T, address string) string {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+address+metricsPath, http.NoBody)
+	require.NoError(t, err)
+
+	resp, err := newTestHTTPClient(t).Do(req)
+	require.NoError(t, err, "%s is serving metrics", address)
+
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	return string(raw)
+}
+
+// startedAddress returns the address a handler logged as listening on.
+func startedAddress(t *testing.T, logs *logCapture) string {
+	t.Helper()
+
+	// The entry is written before NewPrometheusHandler returns.
+	entry, ok := logs.find(prometheusStartMessage)
+	require.True(t, ok, "the start message is logged")
+
+	return requireAssignedAddress(t, entry, "127.0.0.1")
+}
 
 // collidingCounter builds a counter registered under the name tally derives for
 // prefix and name - "<prefix>_<name>_total" - but with a different help string,
@@ -164,10 +254,7 @@ func TestNewPrometheusHandler(t *testing.T) {
 
 		registry := prom.NewRegistry()
 
-		handler, err := NewPrometheusHandler(freeListenAddress, "myprefix", registry)
-
-		require.NoError(t, err)
-		require.NotNil(t, handler)
+		handler := newTestPrometheusHandler(t, freeListenAddress, "myprefix", registry)
 
 		// Creating a metric registers it with the registry immediately.
 		handler.Counter("things_done").Inc(1)
@@ -180,9 +267,7 @@ func TestNewPrometheusHandler(t *testing.T) {
 
 		registry := prom.NewRegistry()
 
-		handler, err := NewPrometheusHandler(freeListenAddress, "", registry)
-
-		require.NoError(t, err)
+		handler := newTestPrometheusHandler(t, freeListenAddress, "", registry)
 
 		handler.Counter("unprefixed_things").Inc(1)
 
@@ -194,9 +279,7 @@ func TestNewPrometheusHandler(t *testing.T) {
 
 		registry := prom.NewRegistry()
 
-		handler, err := NewPrometheusHandler(freeListenAddress, "my.prefix", registry)
-
-		require.NoError(t, err)
+		handler := newTestPrometheusHandler(t, freeListenAddress, "my.prefix", registry)
 
 		handler.Counter("things.done").Inc(1)
 		handler.Gauge("things.pending").Update(1)
@@ -212,9 +295,7 @@ func TestNewPrometheusHandler(t *testing.T) {
 
 		registry := prom.NewRegistry()
 
-		handler, err := NewPrometheusHandler(freeListenAddress, "tagged", registry)
-
-		require.NoError(t, err)
+		handler := newTestPrometheusHandler(t, freeListenAddress, "tagged", registry)
 
 		handler.WithTags(map[string]string{"task.queue": "my-queue"}).Counter("tagged_things").Inc(1)
 
@@ -238,6 +319,102 @@ func TestNewPrometheusHandler(t *testing.T) {
 		// Label names and values are both sanitised by the configured options.
 		assert.Equal(t, []string{"task_queue=my_queue"}, labels)
 	})
+
+	t.Run("rejects a listen address without a port", func(t *testing.T) {
+		t.Parallel()
+
+		handler, err := NewPrometheusHandler("not-a-valid-address", "noport", prom.NewRegistry())
+
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "error listening for Prometheus")
+		assert.Nil(t, handler)
+	})
+
+	t.Run("returns a bind failure synchronously", func(t *testing.T) {
+		t.Parallel()
+
+		// The test holds the port for its whole duration, so the bind is
+		// guaranteed to fail.
+		occupied, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", freeListenAddress)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = occupied.Close() })
+
+		recorder := &errorRecorder{}
+
+		handler, err := NewPrometheusHandler(occupied.Addr().String(), "occupied", prom.NewRegistry(), recorder.onError)
+
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "error listening for Prometheus")
+		assert.ErrorIs(t, err, syscall.EADDRINUSE)
+		assert.Nil(t, handler)
+		assert.Empty(t, recorder.errors(), "a bind failure is returned, not reported")
+	})
+
+	t.Run("serves on an explicit port until closed", func(t *testing.T) {
+		t.Parallel()
+
+		recorder := &errorRecorder{}
+
+		handler, address := startExplicitPrometheusHandler(t, "explicitport", prom.NewRegistry(), recorder.onError)
+
+		handler.Counter("things_done").Inc(1)
+
+		assert.Contains(t, getMetrics(t, address), "explicitport_things_done_total")
+
+		require.NoError(t, handler.Close())
+
+		requireNotServing(t, newTestHTTPClient(t), address)
+		assert.Empty(t, recorder.errors(), "an expected shutdown is not reported as an error")
+	})
+}
+
+// TestPrometheusHandlerZeroValueClose covers Close on a handler that owns
+// nothing.
+func TestPrometheusHandlerZeroValueClose(t *testing.T) {
+	t.Parallel()
+
+	var handler PrometheusHandler
+
+	assert.NoError(t, handler.Close())
+}
+
+// TestNewPrometheusHandlerAssignedPort covers port 0, where the log is the only
+// way to learn the address. It is not parallel because it captures the global
+// logger.
+func TestNewPrometheusHandlerAssignedPort(t *testing.T) {
+	t.Run("serves on the logged address until closed", func(t *testing.T) {
+		logs := captureLogs(t)
+		recorder := &errorRecorder{}
+
+		handler := newTestPrometheusHandler(t, freeListenAddress, "assignedport", prom.NewRegistry(), recorder.onError)
+		address := startedAddress(t, logs)
+
+		handler.Counter("things_done").Inc(1)
+
+		assert.Contains(t, getMetrics(t, address), "assignedport_things_done_total", "metrics are served on the logged address")
+
+		require.NoError(t, handler.Close())
+
+		// The Serve goroutine cannot be observed directly. Waiting until the
+		// address stops answering means it has seen the closed listener, and
+		// a regression that reported the expected shutdown would do so then.
+		requireNotServing(t, newTestHTTPClient(t), address)
+		assert.Empty(t, recorder.errors(), "an expected shutdown is not reported as an error")
+	})
+
+	t.Run("closing straight after construction stops the server", func(t *testing.T) {
+		logs := captureLogs(t)
+		recorder := &errorRecorder{}
+
+		handler := newTestPrometheusHandler(t, freeListenAddress, "closedearly", prom.NewRegistry(), recorder.onError)
+		address := startedAddress(t, logs)
+
+		// Close may run before the Serve goroutine has been scheduled.
+		require.NoError(t, handler.Close())
+
+		requireNotServing(t, newTestHTTPClient(t), address)
+		assert.Empty(t, recorder.errors(), "an expected shutdown is not reported as an error")
+	})
 }
 
 // TestNewPrometheusHandlerNilRegistry covers the branch where no registry is
@@ -247,10 +424,9 @@ func TestNewPrometheusHandler(t *testing.T) {
 // test or leak into anything else that uses the real default registry.
 func TestNewPrometheusHandlerNilRegistry(t *testing.T) {
 	registry := isolateDefaultRegistry(t)
+	logs := captureLogs(t)
 
-	handler, err := NewPrometheusHandler(freeListenAddress, "defaultregistry", nil)
-
-	require.NoError(t, err)
+	handler := newTestPrometheusHandler(t, freeListenAddress, "defaultregistry", nil)
 
 	handler.Counter("things_done").Inc(1)
 
@@ -264,21 +440,27 @@ func TestNewPrometheusHandlerNilRegistry(t *testing.T) {
 
 	assert.Contains(t, names, "defaultregistry_things_done_total")
 	assert.Equal(t, names, registeredMetricNames(t, registry), "the default gatherer is the registry the metric was registered with")
+
+	body := getMetrics(t, startedAddress(t, logs))
+	assert.Contains(t, body, "defaultregistry_things_done_total", "the server gathers from the default registry")
 }
 
 // TestNewPrometheusHandlerWithoutListenAddress covers the branch where no listen
 // address is given and the metrics handler is instead attached to Go's default
 // HTTP mux. It is not parallel and installs its own mux for the duration of the
-// test, because the underlying library registers "/metrics" on whatever mux is
-// installed and a mux panics if the same path is registered twice.
+// test, because "/metrics" is registered on whatever mux is installed and a mux
+// panics if the same path is registered twice. It also captures the global
+// logger, to show that no server of its own is started.
 func TestNewPrometheusHandlerWithoutListenAddress(t *testing.T) {
 	mux := isolateDefaultServeMux(t)
+	logs := captureLogs(t)
 
 	registry := prom.NewRegistry()
 
-	handler, err := NewPrometheusHandler("", "defaultmux", registry)
+	handler := newTestPrometheusHandler(t, "", "defaultmux", registry)
 
-	require.NoError(t, err)
+	_, ok := logs.find(prometheusStartMessage)
+	assert.False(t, ok, "no server is started, so no listening address is logged")
 
 	handler.Counter("things_done").Inc(1)
 
@@ -298,6 +480,10 @@ func TestWithPrometheusMetrics(t *testing.T) {
 	o := mustApplyOptions(t, WithPrometheusMetrics(freeListenAddress, "clientoption", registry))
 
 	require.NotNil(t, o.MetricsHandler)
+
+	handler, ok := o.MetricsHandler.(*PrometheusHandler)
+	require.True(t, ok, "the option installs a *PrometheusHandler")
+	t.Cleanup(func() { _ = handler.Close() })
 
 	o.MetricsHandler.Counter("things_done").Inc(1)
 
@@ -362,10 +548,7 @@ func TestNewPrometheusHandlerErrorHandler(t *testing.T) {
 		registry, fqName := collidingRegistry(t, prefix)
 		recorder := &errorRecorder{}
 
-		handler, err := NewPrometheusHandler(freeListenAddress, prefix, registry, recorder.onError)
-
-		require.NoError(t, err)
-		require.NotNil(t, handler)
+		handler := newTestPrometheusHandler(t, freeListenAddress, prefix, registry, recorder.onError)
 
 		// The supplied handler swallows the error, so allocating the metric
 		// neither panics (tally's default) nor exits (our default).
@@ -385,10 +568,7 @@ func TestNewPrometheusHandlerErrorHandler(t *testing.T) {
 
 		registry, fqName := collidingRegistry(t, prefix)
 
-		handler, err := NewPrometheusHandler(freeListenAddress, prefix, registry, nil)
-
-		require.NoError(t, err)
-		require.NotNil(t, handler)
+		handler := newTestPrometheusHandler(t, freeListenAddress, prefix, registry, nil)
 
 		// tally treats a nil ConfigurationOptions.OnError as "use my default",
 		// and its default panics with the registration error. Recovering here
@@ -412,12 +592,11 @@ func TestNewPrometheusHandlerErrorHandler(t *testing.T) {
 }
 
 // TestNewPrometheusHandlerDefaultErrorHandler documents that with no onError
-// argument the default handler is still log.Fatal, for both of the failures
-// tally reports: a listen address it cannot bind, which it reports
-// asynchronously from the reporter's own goroutine, and a metric registration it
-// cannot make, which it reports synchronously. Neither produces an error from
-// NewPrometheusHandler, and log.Fatal terminates the process, so both have to be
-// observed from a child process.
+// argument the default handler is still log.Fatal for a metric registration
+// that cannot be made. That failure produces no error from NewPrometheusHandler,
+// and log.Fatal terminates the process, so it has to be observed from a child
+// process. Listen failures are returned synchronously and are covered by
+// TestNewPrometheusHandler.
 func TestNewPrometheusHandlerDefaultErrorHandler(t *testing.T) {
 	if mode := os.Getenv(promFatalEnv); mode != "" {
 		runDefaultErrorHandlerChild(mode)
@@ -431,11 +610,6 @@ func TestNewPrometheusHandlerDefaultErrorHandler(t *testing.T) {
 		// expected fragments of the child's stderr
 		expected []string
 	}{
-		{
-			name:     "listen failure",
-			mode:     fatalModeListen,
-			expected: []string{"Error in Prometheus reporter", "not-a-valid-address"},
-		},
 		{
 			name:     "registration failure",
 			mode:     fatalModeRegister,
@@ -454,19 +628,10 @@ func TestNewPrometheusHandlerDefaultErrorHandler(t *testing.T) {
 			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestNewPrometheusHandlerDefaultErrorHandler$")
 			cmd.Env = append(os.Environ(), promFatalEnv+"="+test.mode)
 
-			// The child may block on stdin until it is killed, so it never
-			// trips the Go deadlock detector and the test needs no sleeps.
-			stdin, err := cmd.StdinPipe()
-			require.NoError(t, err)
-
-			defer func() {
-				_ = stdin.Close()
-			}()
-
 			var stderr bytes.Buffer
 			cmd.Stderr = &stderr
 
-			err = cmd.Run()
+			err := cmd.Run()
 
 			var exitErr *exec.ExitError
 			require.ErrorAs(t, err, &exitErr, "stderr: %s", stderr.String())
@@ -485,11 +650,6 @@ func TestNewPrometheusHandlerDefaultErrorHandler(t *testing.T) {
 // the one under test, and it expects never to return.
 func runDefaultErrorHandlerChild(mode string) {
 	switch mode {
-	case fatalModeListen:
-		mustChildHandler("not-a-valid-address", "child", prom.NewRegistry())
-
-		// Block until the reporter's goroutine terminates the process.
-		_, _ = io.Copy(io.Discard, os.Stdin)
 	case fatalModeRegister:
 		const prefix = "child"
 
