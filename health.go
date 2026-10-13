@@ -229,15 +229,15 @@ func NewHealthCheck(ctx context.Context, taskQueues []string, address string, c 
 		Handler:           mux,
 	}
 
-	l := log.With().
-		Str("address", address).
-		Int("taskQueueCount", len(taskQueues)).
-		Logger()
-
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", address)
 	if err != nil {
 		return fmt.Errorf("error listening on %s: %w", address, err)
 	}
+
+	l := log.With().
+		Str("address", listener.Addr().String()).
+		Int("taskQueueCount", len(taskQueues)).
+		Logger()
 
 	go func() {
 		<-ctx.Done()

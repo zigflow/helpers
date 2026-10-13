@@ -114,13 +114,13 @@ func NewCobraOpts(cmd *cobra.Command, opts *TemporalOpts) *TemporalOpts {
 	viper.SetDefault("health_listen_address", "0.0.0.0:3000")
 	cmd.Flags().StringVar(
 		&opts.HealthListenAddress, "health-listen-address",
-		viper.GetString("health_listen_address"), "Address of health server",
+		viper.GetString("health_listen_address"), "Address of health server. If the port is 0, a random available port is assigned.",
 	)
 
 	viper.SetDefault("metrics_listen_address", "0.0.0.0:9090")
 	cmd.Flags().StringVar(
 		&opts.MetricsListenAddress, "metrics-listen-address",
-		viper.GetString("metrics_listen_address"), "Address of Prometheus metrics server",
+		viper.GetString("metrics_listen_address"), "Address of Prometheus metrics server. If the port is 0, a random available port is assigned.",
 	)
 
 	cmd.Flags().StringVar(
