@@ -1,0 +1,52 @@
+name: Update Dependencies
+
+on:
+  schedule:
+    - cron: "0 0 1 * *"
+  workflow_dispatch:
+
+jobs:
+  update-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: 3.x
+
+      - name: Update Pre-Commit dependencies
+        run: |
+          pip install pre-commit
+          pre-commit autoupdate
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Update Go dependencies
+        run: |
+          go get -u ./...
+          go mod tidy
+          go generate ./...
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          commit-message: "chore: update dependencies"
+          title: "chore: update dependencies"
+          body: |
+            Automated dependency refresh.
+
+            - Pre-commit dependencies updated via `pre-commit autoupdate`
+            - Go dependencies updated via `go get -u ./...` and `go mod tidy`
+          branch: chore/update-deps
+          delete-branch: true
+          labels: dependencies
+          signoff: true
+          token: ${{ secrets.MONTHLY_UPDATE_TOKEN }}
