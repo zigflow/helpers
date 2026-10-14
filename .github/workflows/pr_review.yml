@@ -1,0 +1,203 @@
+name: PR Review
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codex_review:
+    runs-on: ubuntu-latest
+    if: |
+      github.event.pull_request.head.repo.full_name == github.repository ||
+      (github.event.action == 'labeled' && github.event.label.name == 'ai-review')
+    permissions:
+      contents: read
+    outputs:
+      final_message: ${{ steps.run_codex.outputs['final-message'] }}
+      codex_succeeded: ${{ steps.run_codex.outcome == 'success' }}
+    steps:
+      # Runner-level egress firewall: block all outbound traffic except the
+      # endpoints needed to check out code and run codex. Even if injected fork
+      # code escapes the codex sandbox, it cannot exfiltrate secrets.
+      # NOTE: if the workflow fails on a blocked endpoint, temporarily set
+      # `egress-policy: audit`, read the harden-runner run summary for the
+      # missing host, add it below, then switch back to `block`.
+      # Don't disable sudo here: codex-action needs it during setup to enable
+      # user namespaces / clear AppArmor for its bubblewrap sandbox. Its own
+      # `safety-strategy: drop-sudo` revokes sudo afterwards.
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.openai.com:443
+            registry.npmjs.org:443
+            github.com:443
+            api.github.com:443
+            codeload.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+          # pull_request_target intentionally reviews fork PRs gated behind the
+          # `ai-review` label; v7 requires explicit opt-in to check out fork code.
+          allow-unsafe-pr-checkout: true
+          # Don't leave the GITHUB_TOKEN on disk for the codex step to find.
+          persist-credentials: false
+
+      - name: Fetch base branch and PR head
+        run: |
+          git fetch --no-tags origin \
+            "${{ github.event.pull_request.base.ref }}" \
+            "+refs/pull/${{ github.event.pull_request.number }}/head"
+
+      - name: Run Codex review
+        id: run_codex
+        continue-on-error: true
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: |
+            Review this pull request as a code reviewer.
+
+            Only report actionable issues introduced by the changes in this PR.
+            Do not comment on pre-existing issues, unrelated code, or general
+            improvements unless they are directly caused by this PR.
+
+            The goal of this review is to determine if the PR is ready to ship.
+            Focus on issues that would block a "ship it" decision.
+
+            Prioritise:
+            - correctness regressions
+            - security issues introduced by the change
+            - missing or inadequate tests for changed behaviour
+            - maintainability problems that would make future changes harder or riskier
+
+            For each issue:
+            - clearly state severity (high, medium, low)
+            - explain why it matters
+            - suggest a concrete fix where possible
+
+            Avoid nitpicks and stylistic suggestions unless they meaningfully
+            impact maintainability or correctness.
+
+            When reviewing Go code:
+            - read the `go` directive in `go.mod` before reporting any Go
+              language, compiler, standard library or tooling issue
+            - treat that declared Go version as authoritative for supported
+              language features, and do not rely on assumptions from older Go
+              versions
+            - if a finding depends on version-specific behaviour, verify it
+              against the declared version and state which Go version
+              introduced or changed that behaviour
+            - do not claim that code cannot compile if the repository's CI has
+              successfully compiled or tested that same code with the declared
+              Go version, unless you first reconcile that evidence
+
+            When referencing files, do not use local runner paths such as
+            /home/runner/work/...
+
+            Always format file links as GitHub blob URLs using this base:
+            ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.event.pull_request.head.sha }}
+
+            Examples:
+            - [Dockerfile](${{ github.server_url }}/${{ github.repository }}/blob/${{ github.event.pull_request.head.sha }}/Dockerfile#L50)
+            - [cmd/run.go](${{ github.server_url }}/${{ github.repository }}/blob/${{ github.event.pull_request.head.sha }}/cmd/run.go#L159-L165)
+
+            If there are no blocking or significant issues, explicitly say:
+            "No blocking issues. Ship it."
+
+            Use British English spelling and punctuation.
+
+            Be concise and specific.
+          # read-only sandbox: codex may read the (untrusted) fork code and send
+          # it to the OpenAI API, but injected shell commands cannot write files
+          # or reach the network — so a prompt-injection attack cannot exfiltrate
+          # OPENAI_API_KEY.
+          # sandbox: read-only blocks codex's spawned commands from writing
+          # files or reaching the network (so injected fork code can't exfil
+          # OPENAI_API_KEY); drop-sudo revokes the runner user's sudo after the
+          # action's own sandbox setup completes.
+          sandbox: read-only
+          safety-strategy: drop-sudo
+
+  post_review_comment:
+    runs-on: ubuntu-latest
+    needs: codex_review
+    if: |
+      needs.codex_review.outputs.codex_succeeded == 'true' &&
+      needs.codex_review.outputs.final_message != ''
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post review comment to PR
+        uses: actions/github-script@v9
+        env:
+          CODEX_REVIEW: ${{ needs.codex_review.outputs.final_message }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const hasAiReviewLabel = context.payload.pull_request.labels.some(
+              label => label.name === 'ai-review'
+            );
+
+            const preamble = hasAiReviewLabel
+              ? [
+                  '> Automated review note: Zigflow uses AI-assisted PR review tooling to help identify potential bugs, regressions and edge cases.',
+                  '> These comments are intended as supplemental review feedback only and may occasionally be incorrect or overly cautious.',
+                  '> Please treat them as additional input for discussion rather than authoritative project direction.',
+                  '',
+                  '',
+                ].join('\n')
+              : '';
+
+            const marker = '<!-- codex-pr-review -->';
+
+            const body = [
+              marker,
+              '## Codex PR Review',
+              '',
+              `${preamble}${process.env.CODEX_REVIEW}`,
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+            });
+
+            const existing = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body &&
+              comment.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
