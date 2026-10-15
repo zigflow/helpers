@@ -26,6 +26,7 @@ holding the pieces that tend to be rewritten in every service.
   * [slog](#slog)
   * [Zap](#zap)
 * [Saga compensation](#saga-compensation)
+* [HTTP activities](#http-activities)
 * [Go compatibility](#go-compatibility)
 * [Contributing](#contributing)
   * [Open in a container](#open-in-a-container)
@@ -49,6 +50,7 @@ applications:
 * Prometheus metrics
 * Zerolog integration
 * saga compensation
+* HTTP requests from activities
 
 These helpers build on the Temporal Go SDK rather than replacing it. A
 connection is described by a list of `Option` values and produces an ordinary
@@ -497,6 +499,81 @@ The disconnected context keeps the parent's configuration, such as activity
 options, but not its cancellation, so compensations still run for a workflow
 that is being cancelled. It is cancelled once `Compensate` returns, so a
 compensation must complete its work before returning.
+
+## HTTP activities
+
+`HTTPActivity` makes HTTP requests from Temporal activities. Construct it once
+at worker startup with `NewHTTPActivity`, then inject it into the application's
+activity struct. Each activity builds its own request and turns the response
+into a domain result, and workflow code never performs the request itself.
+`Order`, `OrderResult`, `OrderActivities` and the URL are application-specific
+placeholders:
+
+```go
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "net/http"
+
+    temporal "github.com/zigflow/helpers"
+)
+
+type OrderActivities struct {
+    http *temporal.HTTPActivity
+}
+
+func (a *OrderActivities) CreateOrder(ctx context.Context, order Order) (*OrderResult, error) {
+    body, err := json.Marshal(order)
+    if err != nil {
+        return nil, fmt.Errorf("error encoding order: %w", err)
+    }
+
+    res, err := a.http.Call(ctx, temporal.HTTPRequest{
+        Method: http.MethodPost,
+        URL:    "https://orders.example.com/v1/orders",
+        Headers: http.Header{
+            "Content-Type": {"application/json"},
+            // Derived from the order, so it is the same on every attempt.
+            "Idempotency-Key": {order.ID},
+        },
+        Body: body,
+    })
+    if err != nil {
+        // Preserve the helper's retry classification and retry delay.
+        return nil, err
+    }
+
+    var result OrderResult
+    if err := json.Unmarshal(res.Body, &result); err != nil {
+        return nil, fmt.Errorf("error decoding order response: %w", err)
+    }
+
+    return &result, nil
+}
+```
+
+`Call` is an ordinary method call rather than a separate activity, so Temporal
+retries the enclosing activity according to its retry policy. Return helper errors
+unchanged to preserve their retry classification and retry delay. Requests with
+side effects are only safe to retry when the server supports idempotency, for
+example through a key that stays the same across attempts.
+
+| Option            | Default                      |
+| ----------------- | ---------------------------- |
+| `WithTimeout`     | five seconds                 |
+| `WithMaxBodySize` | 1 MiB response body          |
+| `WithNoRedirect`  | Go's default redirect policy |
+| `WithTransport`   | Go's default transport       |
+| `WithCookieJar`   | no cookie jar                |
+
+For simple requests, `Call` can also be registered with a worker as an activity
+in its own right, preferably under an explicit name.
+
+See the
+[API documentation](https://pkg.go.dev/github.com/zigflow/helpers#HTTPActivity)
+for request and response fields, the status retry policy, error details and
+cancellation behaviour.
 
 ## Go compatibility
 
