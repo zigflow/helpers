@@ -466,7 +466,7 @@ func WithMaxBodySize(maxBodyBytes int64) HTTPOption {
 		if maxBodyBytes <= 0 || maxBodyBytes == math.MaxInt64 {
 			return fmt.Errorf(
 				"maximum body size must be positive and below %d: %d",
-				math.MaxInt64,
+				int64(math.MaxInt64),
 				maxBodyBytes,
 			)
 		}
