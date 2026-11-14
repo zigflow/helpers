@@ -17,6 +17,8 @@
 package temporal
 
 import (
+	"bytes"
+	"io"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -34,6 +36,47 @@ const (
 	flagServerName = "flag.sni.example.com"
 	// flagKey is a fake Temporal API key.
 	flagKey = "flag-api-key"
+	// viperKey is a fake Temporal API key supplied through Viper. It is
+	// distinctive so that any leak into help output is unambiguous.
+	viperKey = "viper-api-key-must-never-be-printed"
+)
+
+// Command-line arguments shared by the flag parsing and inheritance tests.
+const (
+	childCommand  = "child"
+	hostPortFlag  = "-H"
+	namespaceFlag = "-n"
+	tlsFlag       = "--temporal-tls"
+)
+
+// Defaults applied when neither Viper nor the command line supplies a value.
+const (
+	defaultHealthListenAddress  = "0.0.0.0:3000"
+	defaultMetricsListenAddress = "0.0.0.0:9090"
+)
+
+// registrationMode is one way of calling NewCobraOpts.
+type registrationMode struct {
+	name       string
+	config     []*CobraOpts
+	persistent bool
+}
+
+var (
+	defaultMode    = registrationMode{name: "no config"}
+	persistentMode = registrationMode{name: "persistent", config: []*CobraOpts{{Persistent: true}}, persistent: true}
+
+	// registrationModes covers every supported way of calling NewCobraOpts.
+	registrationModes = []registrationMode{
+		defaultMode,
+		{name: "empty config", config: []*CobraOpts{{}}},
+		{name: "persistent false", config: []*CobraOpts{{Persistent: false}}},
+		persistentMode,
+	}
+
+	// bothModes covers local and persistent registration, for behaviour that
+	// must not depend on which flag set receives the flags.
+	bothModes = []registrationMode{defaultMode, persistentMode}
 )
 
 // resetViper isolates a test from Viper's global state, both before and after it
@@ -46,38 +89,77 @@ func resetViper(t *testing.T) {
 }
 
 // newTestCommand returns a command with the Temporal flags registered against a
-// zero-valued TemporalOpts.
-func newTestCommand(t *testing.T) (*cobra.Command, *TemporalOpts) {
+// zero-valued TemporalOpts. It is runnable so that its help includes the flags.
+func newTestCommand(t *testing.T, configOpts ...*CobraOpts) (*cobra.Command, *TemporalOpts) {
 	t.Helper()
 
-	cmd := &cobra.Command{Use: "test"}
-	opts := NewCobraOpts(cmd, &TemporalOpts{})
+	cmd := &cobra.Command{Use: "test", Run: func(*cobra.Command, []string) {}}
+	opts := NewCobraOpts(cmd, &TemporalOpts{}, configOpts...)
 
 	return cmd, opts
 }
 
-// lookupFlag returns a registered flag, failing the test if it is missing.
-func lookupFlag(t *testing.T, cmd *cobra.Command, name string) *pflag.Flag {
+// newParentAndChild returns a parent command with the Temporal flags registered
+// in the given mode, and a runnable child of it. ran reports whether the child
+// was executed.
+func newParentAndChild(t *testing.T, mode registrationMode) (parent *cobra.Command, opts *TemporalOpts, ran *bool) {
 	t.Helper()
 
-	flag := cmd.Flags().Lookup(name)
+	ran = new(bool)
+	parent = &cobra.Command{Use: "parent", SilenceErrors: true, SilenceUsage: true}
+	opts = NewCobraOpts(parent, &TemporalOpts{}, mode.config...)
+	parent.AddCommand(&cobra.Command{
+		Use: childCommand,
+		Run: func(*cobra.Command, []string) { *ran = true },
+	})
+	parent.SetOut(io.Discard)
+	parent.SetErr(io.Discard)
+
+	return parent, opts, ran
+}
+
+// registeredFlags returns the flag set NewCobraOpts is expected to register on.
+// Only use it before the command executes, as Cobra then merges persistent flags
+// into the local flag set.
+func registeredFlags(cmd *cobra.Command, persistent bool) *pflag.FlagSet {
+	if persistent {
+		return cmd.PersistentFlags()
+	}
+
+	return cmd.Flags()
+}
+
+// lookupFlag returns a registered flag, failing the test if it is missing.
+func lookupFlag(t *testing.T, flags *pflag.FlagSet, name string) *pflag.Flag {
+	t.Helper()
+
+	flag := flags.Lookup(name)
 	require.NotNil(t, flag, "flag %q should be registered", name)
 
 	return flag
 }
 
+// renderHelp executes cmd with args followed by --help and returns the output.
+func renderHelp(t *testing.T, cmd *cobra.Command, args ...string) string {
+	t.Helper()
+
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs(append(args, "--help"))
+	require.NoError(t, cmd.Execute())
+
+	return out.String()
+}
+
 func TestNewCobraOptsRegistersFlags(t *testing.T) {
-	resetViper(t)
-
-	cmd, _ := newTestCommand(t)
-
 	tests := []struct {
 		flag      string
 		shorthand string
 		defValue  string
 	}{
-		{flag: "health-listen-address", defValue: "0.0.0.0:3000"},
-		{flag: "metrics-listen-address", defValue: "0.0.0.0:9090"},
+		{flag: "health-listen-address", defValue: defaultHealthListenAddress},
+		{flag: "metrics-listen-address", defValue: defaultMetricsListenAddress},
 		{flag: "metrics-prefix", defValue: ""},
 		{flag: "temporal-address", shorthand: "H", defValue: client.DefaultHostPort},
 		{flag: "temporal-api-key", defValue: ""},
@@ -88,83 +170,108 @@ func TestNewCobraOptsRegistersFlags(t *testing.T) {
 		{flag: "temporal-tls", defValue: "false"},
 	}
 
-	for _, test := range tests {
-		t.Run(test.flag, func(t *testing.T) {
-			flag := lookupFlag(t, cmd, test.flag)
+	for _, mode := range registrationModes {
+		t.Run(mode.name, func(t *testing.T) {
+			resetViper(t)
 
-			assert.Equal(t, test.shorthand, flag.Shorthand)
-			assert.Equal(t, test.defValue, flag.DefValue)
-			assert.NotEmpty(t, flag.Usage, "flag should be documented")
+			// Inspect the flag sets before execution, as Cobra merges
+			// persistent flags into the local set when the command runs.
+			cmd, _ := newTestCommand(t, mode.config...)
+			flags := registeredFlags(cmd, mode.persistent)
+
+			for _, test := range tests {
+				t.Run(test.flag, func(t *testing.T) {
+					flag := lookupFlag(t, flags, test.flag)
+
+					assert.Equal(t, test.shorthand, flag.Shorthand)
+					assert.Equal(t, test.defValue, flag.DefValue)
+					assert.NotEmpty(t, flag.Usage, "flag should be documented")
+				})
+			}
+
+			assert.Equal(t, len(tests), countFlags(flags), "no unexpected flags should be registered")
+			assert.Zero(t, countFlags(registeredFlags(cmd, !mode.persistent)), "flags should only be registered on one flag set")
 		})
 	}
-
-	assert.Equal(t, len(tests), countFlags(cmd), "no unexpected flags should be registered")
 }
 
-// countFlags returns the number of flags registered on the command.
-func countFlags(cmd *cobra.Command) int {
+// countFlags returns the number of flags in the flag set.
+func countFlags(flags *pflag.FlagSet) int {
 	count := 0
-	cmd.Flags().VisitAll(func(*pflag.Flag) { count++ })
+	flags.VisitAll(func(*pflag.Flag) { count++ })
 
 	return count
 }
 
 func TestNewCobraOptsDefaults(t *testing.T) {
-	resetViper(t)
+	for _, mode := range bothModes {
+		t.Run(mode.name, func(t *testing.T) {
+			resetViper(t)
 
-	_, opts := newTestCommand(t)
+			_, opts := newTestCommand(t, mode.config...)
 
-	assert.Equal(t, &TemporalOpts{
-		Address:              client.DefaultHostPort,
-		HealthListenAddress:  "0.0.0.0:3000",
-		MetricsListenAddress: "0.0.0.0:9090",
-		Namespace:            client.DefaultNamespace,
-	}, opts)
+			assert.Equal(t, &TemporalOpts{
+				Address:              client.DefaultHostPort,
+				HealthListenAddress:  defaultHealthListenAddress,
+				MetricsListenAddress: defaultMetricsListenAddress,
+				Namespace:            client.DefaultNamespace,
+			}, opts)
+		})
+	}
 }
 
 func TestNewCobraOptsReturnsTheSuppliedStruct(t *testing.T) {
-	resetViper(t)
+	for _, mode := range registrationModes {
+		t.Run(mode.name, func(t *testing.T) {
+			resetViper(t)
 
-	cmd := &cobra.Command{Use: "test"}
-	in := &TemporalOpts{}
+			cmd := &cobra.Command{Use: "test"}
+			in := &TemporalOpts{}
 
-	out := NewCobraOpts(cmd, in)
+			out := NewCobraOpts(cmd, in, mode.config...)
 
-	assert.Same(t, in, out)
+			assert.Same(t, in, out)
+		})
+	}
 }
 
 func TestNewCobraOptsUsesViperValues(t *testing.T) {
-	resetViper(t)
+	for _, mode := range bothModes {
+		t.Run(mode.name, func(t *testing.T) {
+			resetViper(t)
 
-	viper.Set("health_listen_address", "127.0.0.1:1234")
-	viper.Set("metrics_listen_address", "127.0.0.1:5678")
-	viper.Set("metrics_prefix", "my_prefix")
-	viper.Set("temporal_address", testHostPort)
-	viper.Set("temporal_api_key", testKey)
-	viper.Set("temporal_tls_client_cert_path", "/certs/client.pem")
-	viper.Set("temporal_tls_client_key_path", "/certs/client.key")
-	viper.Set("temporal_namespace", testNamespace)
-	viper.Set("temporal_server_name", testServerName)
-	viper.Set("temporal_tls", true)
+			viper.Set("health_listen_address", "127.0.0.1:1234")
+			viper.Set("metrics_listen_address", "127.0.0.1:5678")
+			viper.Set("metrics_prefix", "my_prefix")
+			viper.Set("temporal_address", testHostPort)
+			viper.Set("temporal_api_key", testKey)
+			viper.Set("temporal_tls_client_cert_path", "/certs/client.pem")
+			viper.Set("temporal_tls_client_key_path", "/certs/client.key")
+			viper.Set("temporal_namespace", testNamespace)
+			viper.Set("temporal_server_name", testServerName)
+			viper.Set("temporal_tls", true)
 
-	cmd, opts := newTestCommand(t)
+			cmd, opts := newTestCommand(t, mode.config...)
 
-	assert.Equal(t, &TemporalOpts{
-		Address:              testHostPort,
-		APIKey:               testKey,
-		HealthListenAddress:  "127.0.0.1:1234",
-		MetricsListenAddress: "127.0.0.1:5678",
-		MetricsPrefix:        "my_prefix",
-		MTLSCertPath:         "/certs/client.pem",
-		MTLSKeyPath:          "/certs/client.key",
-		Namespace:            testNamespace,
-		ServerName:           testServerName,
-		TLSEnabled:           true,
-	}, opts)
+			assert.Equal(t, &TemporalOpts{
+				Address:              testHostPort,
+				APIKey:               testKey,
+				HealthListenAddress:  "127.0.0.1:1234",
+				MetricsListenAddress: "127.0.0.1:5678",
+				MetricsPrefix:        "my_prefix",
+				MTLSCertPath:         "/certs/client.pem",
+				MTLSKeyPath:          "/certs/client.key",
+				Namespace:            testNamespace,
+				ServerName:           testServerName,
+				TLSEnabled:           true,
+			}, opts)
 
-	// Viper values become the flag defaults too, so `--help` reflects them.
-	assert.Equal(t, testHostPort, lookupFlag(t, cmd, "temporal-address").DefValue)
-	assert.Equal(t, "true", lookupFlag(t, cmd, "temporal-tls").DefValue)
+			// Viper values become the flag defaults too, so `--help` reflects them.
+			flags := registeredFlags(cmd, mode.persistent)
+			assert.Equal(t, testHostPort, lookupFlag(t, flags, "temporal-address").DefValue)
+			assert.Equal(t, "true", lookupFlag(t, flags, "temporal-tls").DefValue)
+		})
+	}
 }
 
 func TestNewCobraOptsHidesTheAPIKeyDefault(t *testing.T) {
@@ -180,8 +287,145 @@ func TestNewCobraOptsHidesTheAPIKeyDefault(t *testing.T) {
 		},
 		{
 			name:             "api key configured",
-			apiKey:           "super-secret",
+			apiKey:           viperKey,
 			expectedDefValue: "***",
+		},
+	}
+
+	for _, mode := range bothModes {
+		for _, test := range tests {
+			t.Run(mode.name+"/"+test.name, func(t *testing.T) {
+				resetViper(t)
+
+				if test.apiKey != "" {
+					viper.Set("temporal_api_key", test.apiKey)
+				}
+
+				cmd, opts := newTestCommand(t, mode.config...)
+
+				flag := lookupFlag(t, registeredFlags(cmd, mode.persistent), "temporal-api-key")
+
+				assert.Equal(t, test.expectedDefValue, flag.DefValue)
+				assert.Equal(t, test.apiKey, opts.APIKey, "the value itself is still available to the program")
+
+				help := renderHelp(t, cmd)
+				assert.Contains(t, help, "--temporal-api-key", "the flag should remain discoverable")
+
+				if test.apiKey != "" {
+					assert.NotContains(t, help, test.apiKey, "the api key should never be printed")
+				}
+			})
+		}
+	}
+}
+
+func TestNewCobraOptsHidesTheAPIKeyFromInheritedHelp(t *testing.T) {
+	resetViper(t)
+
+	viper.Set("temporal_api_key", viperKey)
+
+	parent, opts, _ := newParentAndChild(t, persistentMode)
+
+	help := renderHelp(t, parent, childCommand)
+
+	assert.Contains(t, help, "--temporal-api-key", "the inherited flag should remain discoverable")
+	assert.NotContains(t, help, viperKey, "the api key should never be printed")
+	assert.Equal(t, viperKey, opts.APIKey, "the value itself is still available to the program")
+}
+
+func TestNewCobraOptsFlagParsing(t *testing.T) {
+	for _, mode := range bothModes {
+		t.Run(mode.name, func(t *testing.T) {
+			resetViper(t)
+
+			// Explicit flags should win over Viper-provided defaults.
+			viper.Set("temporal_namespace", testNamespace)
+
+			cmd, opts := newTestCommand(t, mode.config...)
+
+			require.NoError(t, cmd.ParseFlags([]string{
+				"--health-listen-address", "127.0.0.1:1",
+				"--metrics-listen-address", "127.0.0.1:2",
+				"--metrics-prefix", "prefix",
+				hostPortFlag, flagHostPort,
+				"--temporal-api-key", flagKey,
+				"--tls-client-cert-path", "/flag/client.pem",
+				"--tls-client-key-path", "/flag/client.key",
+				namespaceFlag, flagNamespace,
+				"--temporal-server-name", flagServerName,
+				tlsFlag,
+			}))
+
+			assert.Equal(t, &TemporalOpts{
+				Address:              flagHostPort,
+				APIKey:               flagKey,
+				HealthListenAddress:  "127.0.0.1:1",
+				MetricsListenAddress: "127.0.0.1:2",
+				MetricsPrefix:        "prefix",
+				MTLSCertPath:         "/flag/client.pem",
+				MTLSKeyPath:          "/flag/client.key",
+				Namespace:            flagNamespace,
+				ServerName:           flagServerName,
+				TLSEnabled:           true,
+			}, opts)
+		})
+	}
+}
+
+// TestNewCobraOptsPersistentFlagsAreInherited executes a child command to prove
+// that flags registered persistently on its parent are usable from the child.
+func TestNewCobraOptsPersistentFlagsAreInherited(t *testing.T) {
+	defaults := TemporalOpts{
+		Address:              client.DefaultHostPort,
+		HealthListenAddress:  defaultHealthListenAddress,
+		MetricsListenAddress: defaultMetricsListenAddress,
+		Namespace:            client.DefaultNamespace,
+	}
+
+	tests := []struct {
+		name     string
+		viper    map[string]any
+		args     []string
+		expected func(o *TemporalOpts)
+	}{
+		{
+			name:     "defaults",
+			args:     []string{childCommand},
+			expected: func(*TemporalOpts) {},
+		},
+		{
+			name:  "viper values",
+			viper: map[string]any{"temporal_namespace": testNamespace, "temporal_tls": true},
+			args:  []string{childCommand},
+			expected: func(o *TemporalOpts) {
+				o.Namespace = testNamespace
+				o.TLSEnabled = true
+			},
+		},
+		{
+			name: "long string and boolean flags",
+			args: []string{childCommand, "--temporal-address", flagHostPort, "--temporal-api-key=" + flagKey, tlsFlag},
+			expected: func(o *TemporalOpts) {
+				o.Address = flagHostPort
+				o.APIKey = flagKey
+				o.TLSEnabled = true
+			},
+		},
+		{
+			name: "shorthand flags",
+			args: []string{childCommand, hostPortFlag, flagHostPort, namespaceFlag, flagNamespace},
+			expected: func(o *TemporalOpts) {
+				o.Address = flagHostPort
+				o.Namespace = flagNamespace
+			},
+		},
+		{
+			name:  "flags override viper values",
+			viper: map[string]any{"temporal_namespace": testNamespace},
+			args:  []string{childCommand, namespaceFlag, flagNamespace},
+			expected: func(o *TemporalOpts) {
+				o.Namespace = flagNamespace
+			},
 		},
 	}
 
@@ -189,54 +433,33 @@ func TestNewCobraOptsHidesTheAPIKeyDefault(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			resetViper(t)
 
-			if test.apiKey != "" {
-				viper.Set("temporal_api_key", test.apiKey)
+			for k, v := range test.viper {
+				viper.Set(k, v)
 			}
 
-			cmd, opts := newTestCommand(t)
+			parent, opts, ran := newParentAndChild(t, persistentMode)
+			parent.SetArgs(test.args)
 
-			flag := lookupFlag(t, cmd, "temporal-api-key")
+			require.NoError(t, parent.Execute())
 
-			assert.Equal(t, test.expectedDefValue, flag.DefValue)
-			assert.Equal(t, test.apiKey, opts.APIKey, "the value itself is still available to the program")
+			expected := defaults
+			test.expected(&expected)
 
-			if test.apiKey != "" {
-				assert.NotContains(t, cmd.UsageString(), test.apiKey, "the api key should never be printed")
-			}
+			assert.True(t, *ran, "the child should run")
+			assert.Equal(t, &expected, opts)
 		})
 	}
 }
 
-func TestNewCobraOptsFlagParsing(t *testing.T) {
+func TestNewCobraOptsLocalFlagsAreNotInherited(t *testing.T) {
 	resetViper(t)
 
-	cmd, opts := newTestCommand(t)
+	parent, opts, ran := newParentAndChild(t, defaultMode)
+	parent.SetArgs([]string{childCommand, namespaceFlag, flagNamespace})
 
-	require.NoError(t, cmd.ParseFlags([]string{
-		"--health-listen-address", "127.0.0.1:1",
-		"--metrics-listen-address", "127.0.0.1:2",
-		"--metrics-prefix", "prefix",
-		"-H", flagHostPort,
-		"--temporal-api-key", flagKey,
-		"--tls-client-cert-path", "/flag/client.pem",
-		"--tls-client-key-path", "/flag/client.key",
-		"-n", flagNamespace,
-		"--temporal-server-name", flagServerName,
-		"--temporal-tls",
-	}))
-
-	assert.Equal(t, &TemporalOpts{
-		Address:              flagHostPort,
-		APIKey:               flagKey,
-		HealthListenAddress:  "127.0.0.1:1",
-		MetricsListenAddress: "127.0.0.1:2",
-		MetricsPrefix:        "prefix",
-		MTLSCertPath:         "/flag/client.pem",
-		MTLSKeyPath:          "/flag/client.key",
-		Namespace:            flagNamespace,
-		ServerName:           flagServerName,
-		TLSEnabled:           true,
-	}, opts)
+	require.Error(t, parent.Execute(), "the child should reject the parent's local flags")
+	assert.False(t, *ran, "the child should not run")
+	assert.Equal(t, client.DefaultNamespace, opts.Namespace)
 }
 
 func TestParseCobraOpts(t *testing.T) {
