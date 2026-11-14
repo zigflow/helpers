@@ -77,6 +77,7 @@ cmd := &cobra.Command{
 import (
 	gh "github.com/mrsimonemms/golang-helpers"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"go.temporal.io/sdk/client"
 )
@@ -97,6 +98,10 @@ type TemporalOpts struct {
 	TLSEnabled           bool
 }
 
+type CobraOpts struct {
+	Persistent bool
+}
+
 // NewCobraOpts registers the Temporal flags on cmd, binding each one to a
 // field of opts, and returns opts for convenience.
 //
@@ -110,61 +115,66 @@ type TemporalOpts struct {
 //
 // The API key's default is hidden from the help output, so a key already in the
 // configuration is not printed to the terminal.
-func NewCobraOpts(cmd *cobra.Command, opts *TemporalOpts) *TemporalOpts {
+func NewCobraOpts(cmd *cobra.Command, opts *TemporalOpts, configOpts ...*CobraOpts) *TemporalOpts {
+	persistent := false
+	if len(configOpts) > 0 {
+		persistent = configOpts[0].Persistent
+	}
+
 	viper.SetDefault("health_listen_address", "0.0.0.0:3000")
-	cmd.Flags().StringVar(
+	flags(cmd, persistent).StringVar(
 		&opts.HealthListenAddress, "health-listen-address",
 		viper.GetString("health_listen_address"), "Address of health server. If the port is 0, a random available port is assigned.",
 	)
 
 	viper.SetDefault("metrics_listen_address", "0.0.0.0:9090")
-	cmd.Flags().StringVar(
+	flags(cmd, persistent).StringVar(
 		&opts.MetricsListenAddress, "metrics-listen-address",
 		viper.GetString("metrics_listen_address"), "Address of Prometheus metrics server. If the port is 0, a random available port is assigned.",
 	)
 
-	cmd.Flags().StringVar(
+	flags(cmd, persistent).StringVar(
 		&opts.MetricsPrefix, "metrics-prefix",
 		viper.GetString("metrics_prefix"), "Prefix for metrics",
 	)
 
 	viper.SetDefault("temporal_address", client.DefaultHostPort)
-	cmd.Flags().StringVarP(
+	flags(cmd, persistent).StringVarP(
 		&opts.Address, "temporal-address", "H",
 		viper.GetString("temporal_address"), "Address of the Temporal server",
 	)
 
-	cmd.Flags().StringVar(
+	flags(cmd, persistent).StringVar(
 		&opts.APIKey, "temporal-api-key",
 		viper.GetString("temporal_api_key"), "API key for Temporal authentication",
 	)
 	// Hide the default value to avoid spaffing the API to command line
 	gh.HideCommandOutput(cmd, "temporal-api-key")
 
-	cmd.Flags().StringVar(
+	flags(cmd, persistent).StringVar(
 		&opts.MTLSCertPath, "tls-client-cert-path",
 		viper.GetString("temporal_tls_client_cert_path"), "Path to mTLS client cert, usually ending in .pem",
 	)
 
-	cmd.Flags().StringVar(
+	flags(cmd, persistent).StringVar(
 		&opts.MTLSKeyPath, "tls-client-key-path",
 		viper.GetString("temporal_tls_client_key_path"), "Path to mTLS client key, usually ending in .key",
 	)
 
 	viper.SetDefault("temporal_namespace", client.DefaultNamespace)
-	cmd.Flags().StringVarP(
+	flags(cmd, persistent).StringVarP(
 		&opts.Namespace, "temporal-namespace", "n",
 		viper.GetString("temporal_namespace"), "Temporal namespace to use",
 	)
 
-	cmd.Flags().StringVar(
+	flags(cmd, persistent).StringVar(
 		&opts.ServerName, "temporal-server-name",
 		viper.GetString("temporal_server_name"),
 		"Override the TLS server name (SNI) used for certificate validation. "+
 			"Required when the endpoint address does not match the certificate hostname, for example AWS PrivateLink.",
 	)
 
-	cmd.Flags().BoolVar(
+	flags(cmd, persistent).BoolVar(
 		&opts.TLSEnabled, "temporal-tls",
 		viper.GetBool("temporal_tls"), "Enable TLS Temporal connection",
 	)
@@ -193,4 +203,12 @@ func ParseCobraOpts(opts *TemporalOpts, overrides ...Option) []Option {
 			opts.MTLSKeyPath,
 		),
 	}, overrides...)
+}
+
+func flags(cmd *cobra.Command, persistent bool) *pflag.FlagSet {
+	if persistent {
+		return cmd.PersistentFlags()
+	}
+
+	return cmd.Flags()
 }
